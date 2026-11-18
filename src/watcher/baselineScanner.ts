@@ -8,7 +8,7 @@
 
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { isExcludedPathSegment } from './pathExclusions';
+import { isExcludedPath } from './pathExclusions';
 import { exceedsLineLimit, exceedsSizeLimitByBytes } from './fileSizeLimit';
 import { BaselineStore } from './baselineStore';
 import { isTextFile } from './fileTypeRules';
@@ -34,7 +34,7 @@ export class BaselineScanner {
       const workers = Array.from({ length: workerCount }, async () => {
         while (nextIndex < uris.length) {
           const uri = uris[nextIndex++];
-          await this.snapshotFile(uri, folderPath);
+          await this.snapshotFile(uri);
         }
       });
       await Promise.all(workers);
@@ -56,14 +56,12 @@ export class BaselineScanner {
     );
   }
 
-  private async snapshotFile(uri: vscode.Uri, folderPath: string): Promise<void> {
+  private async snapshotFile(uri: vscode.Uri): Promise<void> {
     const fullPath = path.resolve(uri.fsPath);
-    const relativePath = path.relative(path.resolve(folderPath), fullPath);
-    const relativeSegments = relativePath.split(path.sep);
-    if (relativeSegments.slice(0, -1).some(segment => segment.startsWith('.'))) {
-      return;
-    }
-    if (isExcludedPathSegment(fullPath) || !isTextFile(path.basename(fullPath))) {
+    // Same filter as WorkspaceWatcher (see pathExclusions.ts). Skipping a file
+    // here that the watcher still processes would make its first write look
+    // like a new file, and Revert would delete it.
+    if (isExcludedPath(fullPath) || !isTextFile(path.basename(fullPath))) {
       return;
     }
     if (this.store.hasState(fullPath)) {

@@ -16,9 +16,16 @@ import { DiffManager } from '../diff/diffManager';
 import { BaselineScanner } from './baselineScanner';
 import { BaselineStore } from './baselineStore';
 import { isTextFile } from './fileTypeRules';
-import { isExcludedPathSegment } from './pathExclusions';
+import { isExcludedPath } from './pathExclusions';
 import { exceedsLineLimit, exceedsSizeLimitByBytes } from './fileSizeLimit';
 import { BurstMeterConfig, WriteBurstMeter } from './writeBurstMeter';
+
+/**
+ * Which file-watcher event reported the write. A `change` proves the file
+ * existed before; a `create` only suggests it is new (a write-to-temp-then-
+ * rename save also reports `create` for an existing file).
+ */
+type WriteEventKind = 'create' | 'change';
 
 interface ExternalWriteOptions {
   burstHoldOverride?: boolean;
@@ -77,7 +84,7 @@ export class WorkspaceWatcher {
   private readonly burstMeter = new WriteBurstMeter();
   /** Giữ external write đến khi initial baseline scan hoàn tất. */
   private baselineScansInProgress = 0;
-  private readonly queuedExternalWrites = new Map<string, { burstHold: boolean; readDelayMs: number; eventAt: number }>();
+  private readonly queuedExternalWrites = new Map<string, { kind: WriteEventKind; burstHold: boolean; readDelayMs: number; eventAt: number }>();
   /** Thời gian giữ file vượt ngưỡng burst chờ xác nhận git trước khi mở diff bình thường. */
   private holdMs = 2000;
   /** File vượt ngưỡng burst, đang chờ xác nhận git (xem resolveOrHold/scheduleHoldResolve). */
@@ -233,11 +240,9 @@ export class WorkspaceWatcher {
     // Sử dụng FileSystemWatcher native của VS Code để tránh kẹt event loop
     // khi tạo mới project có hàng ngàn file (VD: node_modules trong Next.js)
     const fileWatcher = vscode.workspace.createFileSystemWatcher('**/*');
-    const handleUri = (uri: vscode.Uri) => {
-      this.handleExternalWrite(uri);
-    };
-    
-    fileWatcher.onDidChange(handleUri);
+    fileWatcher.onDidChange((uri) => {
+      this.handleExternalWrite(uri, 'change');
+    });
     fileWatcher.onDidCreate((uri) => {
       void this.handleExternalCreate(uri);
     });
@@ -269,7 +274,7 @@ export class WorkspaceWatcher {
         this.queuedExternalWrites.clear();
         for (const [filePath, queuedWrite] of queued) {
           this.lastProcessed.delete(filePath);
-          this.handleExternalWrite(vscode.Uri.file(filePath), {
+          this.handleExternalWrite(vscode.Uri.file(filePath), queuedWrite.kind, {
             burstHoldOverride: queuedWrite.burstHold,
             readDelayMs: queuedWrite.readDelayMs,
             eventAtOverride: queuedWrite.eventAt,
@@ -290,12 +295,12 @@ export class WorkspaceWatcher {
       const isDirectory = (stat.type & vscode.FileType.Directory) !== 0;
       const isSymlink = (stat.type & vscode.FileType.SymbolicLink) !== 0;
       if (!isDirectory) {
-        this.handleExternalWrite(uri);
+        this.handleExternalWrite(uri, 'create');
         return;
       }
 
       const absPath = this.normalizePath(uri.fsPath);
-      if (isSymlink || isExcludedPathSegment(absPath) || !this.isInWorkspace(absPath)) {
+      if (isSymlink || isExcludedPath(absPath)) {
         return;
       }
       this.scheduleDirectoryScan(uri, absPath);
@@ -347,7 +352,7 @@ export class WorkspaceWatcher {
       for (const [name, type] of entries) {
         const childUri = vscode.Uri.joinPath(directory, name);
         const childPath = this.normalizePath(childUri.fsPath);
-        if (isExcludedPathSegment(childPath) || (type & vscode.FileType.SymbolicLink) !== 0) {
+        if (isExcludedPath(childPath) || (type & vscode.FileType.SymbolicLink) !== 0) {
           continue;
         }
         if ((type & vscode.FileType.Directory) !== 0) {
@@ -356,7 +361,8 @@ export class WorkspaceWatcher {
           // The directory already had a settle delay, so do not add the normal
           // 200ms file-write delay again. Existing file debounce handles overlap
           // with a child onDidCreate event that VS Code did deliver.
-          this.handleExternalWrite(childUri, { readDelayMs: 0 });
+          // Children of a newly created directory are new files.
+          this.handleExternalWrite(childUri, 'create', { readDelayMs: 0 });
         }
       }
     }
@@ -364,6 +370,7 @@ export class WorkspaceWatcher {
 
   private handleExternalWrite(
     uri: vscode.Uri,
+    kind: WriteEventKind,
     options: ExternalWriteOptions = {}
   ): void {
     const absPath = this.normalizePath(uri.fsPath);
@@ -377,7 +384,8 @@ export class WorkspaceWatcher {
     const burstHold = options.burstHoldOverride ?? this.burstMeter.record(absPath);
 
     // Bỏ qua dependency / build output / tooling (dotnet bin/obj, node_modules, …)
-    if (isExcludedPathSegment(absPath)) {
+    // và mọi thứ ngoài workspace — cùng bộ lọc với BaselineScanner.
+    if (isExcludedPath(absPath)) {
       return;
     }
 
@@ -399,19 +407,23 @@ export class WorkspaceWatcher {
     if (!this.isInWorkspace(absPath)) { return; }
 
     if (this.baselineScansInProgress > 0) {
-      this.queuedExternalWrites.set(absPath, { burstHold, readDelayMs, eventAt });
+      // A file created and then changed while queued is still new: keep
+      // `create`, otherwise the change would make it look like an existing
+      // file without a baseline and its diff would never open.
+      const queuedKind = this.queuedExternalWrites.get(absPath)?.kind === 'create' ? 'create' : kind;
+      this.queuedExternalWrites.set(absPath, { kind: queuedKind, burstHold, readDelayMs, eventAt });
       return;
     }
 
     if (readDelayMs <= 0) {
-      void this.processExternalWrite(uri, absPath, burstHold, eventAt);
+      void this.processExternalWrite(uri, absPath, kind, burstHold, eventAt);
       return;
     }
 
     // Đọc nội dung mới sau một chút để đảm bảo write xong.
     const timer = setTimeout(() => {
       this.pendingTimers.delete(timer);
-      void this.processExternalWrite(uri, absPath, burstHold, eventAt);
+      void this.processExternalWrite(uri, absPath, kind, burstHold, eventAt);
     }, readDelayMs);
     this.pendingTimers.add(timer);
   }
@@ -419,6 +431,7 @@ export class WorkspaceWatcher {
   private async processExternalWrite(
     uri: vscode.Uri,
     absPath: string,
+    kind: WriteEventKind,
     burstHold: boolean,
     eventAt: number
   ): Promise<void> {
@@ -467,6 +480,11 @@ export class WorkspaceWatcher {
         // dung hiện tại làm baseline rồi thôi. Mở diff ở đây sẽ hiện cả file là
         // "thêm mới", và Revert all trên diff đó sẽ xoá mất file.
         if (this.snapshots.consumeSizeSkipped(absPath)) { return; }
+        // A `change` event proves the file existed, but its before-image is
+        // unknown (scanner couldn't read it, `files.exclude`, …). Treating it
+        // as new would make Revert delete a real file, so only take the
+        // current content as its baseline, like the size-skipped case above.
+        if (kind === 'change') { return; }
         // Baseline is already refreshed above; a write the agent didn't make
         // (copying a file in, git, a formatter…) must not open a diff.
         if (!(await this.isAgentWrite(absPath, eventAt, { before: '', existed: false, eventAt }))) { return; }

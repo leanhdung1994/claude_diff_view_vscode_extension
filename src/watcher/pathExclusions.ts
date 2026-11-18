@@ -1,15 +1,43 @@
 /**
- * Path segments to skip for workspace snapshot + external-write diff triggers.
- * Match whole path components (e.g. .../obj/foo.json → skip because of `obj`).
+ * The one path filter shared by the baseline scanner and the workspace
+ * watcher. They MUST agree: a file the watcher processes but the scanner
+ * skipped has no baseline, so its first write looks like a brand-new file and
+ * Revert would delete it.
+ *
+ * Only path components INSIDE the workspace folder are checked (a workspace
+ * that itself lives under e.g. `D:\build\app` is still tracked), compared
+ * case-insensitively so a lowercased (Windows-normalised) path and an
+ * on-disk-case path give the same answer. The file name itself counts as a
+ * component, so `.env`, `.classpath` and `.project` files are excluded too.
  */
 import * as fs from 'fs';
 import * as path from 'path';
+import * as vscode from 'vscode';
 
+/** Lowercase. Dependency, build-output, VCS and tool-cache directories. */
 const EXCLUDED_SEGMENTS = new Set([
   'node_modules',
   '.git',
+  '.hg',
+  '.svn',
   '.next',
   '.nuxt',
+  '.output',
+  '.svelte-kit',
+  '.angular',
+  '.nx',
+  '.turbo',
+  '.cache',
+  '.parcel-cache',
+  '.docusaurus',
+  '.expo',
+  '.vercel',
+  '.serverless',
+  '.yarn',
+  '.pnpm-store',
+  '.terraform',
+  '.history',
+  '.dart_tool',
   'out',
   'dist',
   'build',
@@ -19,7 +47,7 @@ const EXCLUDED_SEGMENTS = new Set([
   // .NET / Visual Studio
   'bin',
   'obj',
-  'TestResults',
+  'testresults',
   'artifacts',
   '.vs',
   // Java / JVM
@@ -37,6 +65,8 @@ const EXCLUDED_SEGMENTS = new Set([
   '.pytest_cache',
   '.mypy_cache',
   '.ruff_cache',
+  '.tox',
+  '.nox',
   'site-packages',
   'dist-info',
   'egg-info',
@@ -51,7 +81,8 @@ const EXCLUDED_SEGMENTS = new Set([
 const nugetPackagesCache = new Map<string, boolean>();
 
 function isNugetPackagesParent(parentDir: string): boolean {
-  const cached = nugetPackagesCache.get(parentDir);
+  const key = process.platform === 'win32' ? parentDir.toLowerCase() : parentDir;
+  const cached = nugetPackagesCache.get(key);
   if (cached !== undefined) { return cached; }
   let result = false;
   try {
@@ -61,18 +92,39 @@ function isNugetPackagesParent(parentDir: string): boolean {
   } catch {
     result = false;
   }
-  nugetPackagesCache.set(parentDir, result);
+  nugetPackagesCache.set(key, result);
   return result;
 }
 
-export function isExcludedPathSegment(absPath: string): boolean {
-  const parts = absPath.split(path.sep);
-  for (let i = 0; i < parts.length; i++) {
-    const p = parts[i];
-    if (EXCLUDED_SEGMENTS.has(p)) { return true; }
-    if (p === 'packages' && i > 0) {
-      const parentDir = parts.slice(0, i).join(path.sep);
-      if (isNugetPackagesParent(parentDir)) { return true; }
+/**
+ * The innermost workspace folder containing `absPath`, and the path's
+ * components relative to it. undefined when it is in no workspace folder.
+ */
+function workspaceRelative(absPath: string): { root: string; segments: string[] } | undefined {
+  const target = path.resolve(absPath);
+  let best: { root: string; segments: string[] } | undefined;
+  for (const folder of vscode.workspace.workspaceFolders ?? []) {
+    const root = path.resolve(folder.uri.fsPath);
+    // path.win32.relative compares case-insensitively, as Windows paths are.
+    const relative = path.relative(root, target);
+    if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) { continue; }
+    if (!best || root.length > best.root.length) {
+      best = { root, segments: relative.split(path.sep).filter(Boolean) };
+    }
+  }
+  return best;
+}
+
+/** True when the file must be neither baselined nor diffed. Outside the workspace counts as excluded. */
+export function isExcludedPath(absPath: string): boolean {
+  const location = workspaceRelative(absPath);
+  if (!location) { return true; }
+  const { root, segments } = location;
+  for (let i = 0; i < segments.length; i++) {
+    const segment = segments[i].toLowerCase();
+    if (EXCLUDED_SEGMENTS.has(segment)) { return true; }
+    if (segment === 'packages' && isNugetPackagesParent(path.join(root, ...segments.slice(0, i)))) {
+      return true;
     }
   }
   return false;
