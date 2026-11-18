@@ -13,13 +13,15 @@ export function registerAllCommands(deps: CommandDeps): void {
   /**
    * The file an Accept/Revert applies to. A diff tab's title-bar button passes
    * that diff's file URI, which is exact even when the
-   * `activeIsPendingDiff` context key lags behind a focus change.
+   * `activeIsPendingDiff` context key lags behind a focus change. Otherwise
+   * (keybinding, Command Palette) only the pending diff in the active tab
+   * counts — never a guess: Revert overwrites the file on disk.
    */
   function getActiveDiffFilePath(arg?: unknown): string | undefined {
     if (arg instanceof vscode.Uri && arg.scheme === 'file' && diffManager.hasPendingDiff(arg.fsPath)) {
       return arg.fsPath;
     }
-    return diffManager.getActiveFilePath() ?? diffManager.getPendingFiles()[0];
+    return diffManager.getActiveDiffPath();
   }
 
   context.subscriptions.push(
@@ -41,7 +43,7 @@ export function registerAllCommands(deps: CommandDeps): void {
     vscode.commands.registerCommand('ai-cli-diff-view.acceptAllHunks', async (arg?: unknown) => {
       const filePath = getActiveDiffFilePath(arg);
       if (!filePath) {
-        vscode.window.showWarningMessage('No pending diff.');
+        vscode.window.showWarningMessage('Open a pending diff first.');
         return;
       }
       await diffManager.accept(filePath);
@@ -64,7 +66,7 @@ export function registerAllCommands(deps: CommandDeps): void {
     vscode.commands.registerCommand('ai-cli-diff-view.revertAllHunks', async (arg?: unknown) => {
       const filePath = getActiveDiffFilePath(arg);
       if (!filePath) {
-        vscode.window.showWarningMessage('No pending diff.');
+        vscode.window.showWarningMessage('Open a pending diff first.');
         return;
       }
       await diffManager.revert(filePath);

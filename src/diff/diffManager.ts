@@ -354,17 +354,6 @@ export class DiffManager implements vscode.Disposable {
     return this.snapshots.has(absPath) ? absPath : undefined;
   }
 
-  /** Active pending diff, else the first open pending diff tab. */
-  getActiveFilePath(): string | undefined {
-    const active = this.getActiveDiffPath();
-    if (active) { return active; }
-    for (const tab of this.allDiffTabs()) {
-      const absPath = normalizePath((tab.input as vscode.TabInputTextDiff).modified.fsPath);
-      if (this.snapshots.has(absPath)) { return absPath; }
-    }
-    return undefined;
-  }
-
   /**
    * Diff tabs survive a window reload, but their snapshot may not (file
    * deleted, workspace state cleared). Close those, since their left side

@@ -121,8 +121,8 @@ All of these are edited in VS Code's Settings UI (the Pending Files gear opens i
 
 | Command | Keybinding | Purpose |
 | --- | --- | --- |
-| `ai-cli-diff-view.acceptAllHunks` | `Ctrl+Shift+Y` (when `activeIsPendingDiff`) | Accept the active (or first open) pending file |
-| `ai-cli-diff-view.revertAllHunks` | `Ctrl+Shift+Z` (when `activeIsPendingDiff`) | Revert the active (or first open) pending file |
+| `ai-cli-diff-view.acceptAllHunks` | `Ctrl+Shift+Y` (when `activeIsPendingDiff`) | Accept the pending diff in the active tab (or the one whose title-bar button was clicked); otherwise warn, never guess |
+| `ai-cli-diff-view.revertAllHunks` | `Ctrl+Shift+Z` (when `activeIsPendingDiff`) | Revert the pending diff in the active tab (or the one whose title-bar button was clicked); otherwise warn, never guess |
 | `ai-cli-diff-view.acceptAllChanges` | — | Accept all pending changes across files |
 | `ai-cli-diff-view.openPendingFile` | — | Open a pending file's diff (takes a path arg) |
 | `ai-cli-diff-view.openSettings` | — | Open Settings filtered to this extension |
