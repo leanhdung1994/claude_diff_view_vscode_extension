@@ -3,8 +3,8 @@
  *
  * Đo tốc độ ghi file thực tế để phân biệt batch operation (git checkout) với
  * AI tool edit — mô tả ở docs/GIT_VS_AI_EDIT_DETECTION.md. Ngưỡng/cửa sổ có
- * thể chỉnh qua settings `ai-cli-diff-view.burstDetection*` (xem Advanced
- * section trong Settings popover của terminal panel).
+ * thể chỉnh qua settings `ai-cli-diff-view.burstDetection*` (VS Code
+ * Settings, hoặc nút bánh răng trên view Pending Files).
  *
  * `record()` trả về quyết định (có vượt ngưỡng burst hay không) để
  * `WorkspaceWatcher` quyết định giữ lại file đó chờ xác nhận git thay vì mở

@@ -1,13 +1,10 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { DiffManager } from '../diff/diffManager';
-import { TerminalPanelProvider } from '../terminal/terminalPanel';
 
 export interface CommandDeps {
   diffManager: DiffManager;
-  panel: TerminalPanelProvider;
   context: vscode.ExtensionContext;
-  openPendingFileInAgent?(filePath: string): boolean;
 }
 
 export function registerAllCommands(deps: CommandDeps): void {
@@ -24,9 +21,6 @@ export function registerAllCommands(deps: CommandDeps): void {
       }
 
       try {
-        if (deps.openPendingFileInAgent?.(filePath)) {
-          return;
-        }
         await diffManager.openDiff(filePath);
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);

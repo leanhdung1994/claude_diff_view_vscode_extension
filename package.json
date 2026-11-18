@@ -135,52 +135,30 @@
     "viewsContainers": {
       "activitybar": [
         {
-          "id": "ai-cli-diff-view-terminal",
-          "title": "AI CLI",
+          "id": "ai-cli-diff-view",
+          "title": "AI CLI Diff",
           "icon": "media/claude-icon.svg"
         }
       ]
     },
     "views": {
-      "ai-cli-diff-view-terminal": [
+      "ai-cli-diff-view": [
         {
-          "id": "ai-cli-diff-view.terminal",
-          "name": "AI CLI",
-          "type": "webview",
-          "when": "ai-cli-diff-view.terminalVisible && !ai-cli-diff-view.terminalFilesPage"
-        },
-        {
-          "id": "ai-cli-diff-view.agentChanges",
-          "name": "PENDING FILES",
-          "type": "webview",
-          "when": "ai-cli-diff-view.agentModeActive || ai-cli-diff-view.terminalVisible && ai-cli-diff-view.terminalFilesPage"
-        }
-      ],
-      "explorer": [
-        {
-          "id": "ai-cli-diff-view.navBar",
-          "name": "AI CLI Diff",
+          "id": "ai-cli-diff-view.pendingFiles",
+          "name": "Pending Files",
           "type": "webview"
         }
       ]
     },
     "commands": [
       {
-        "command": "ai-cli-diff-view.toggleAgentMode",
-        "title": "AI CLI Diff: Toggle Agent Mode"
-      },
-      {
-        "command": "ai-cli-diff-view.focusAgentTerminal",
-        "title": "Back to Agent",
-        "icon": "$(terminal)"
-      },
-      {
         "command": "ai-cli-diff-view.acceptAllHunks",
         "title": "AI CLI Diff: Accept All Changes"
       },
       {
         "command": "ai-cli-diff-view.acceptAllChanges",
-        "title": "AI CLI Diff: Accept All Changes (All Files)"
+        "title": "AI CLI Diff: Accept All Changes (All Files)",
+        "icon": "$(check-all)"
       },
       {
         "command": "ai-cli-diff-view.revertAllHunks",
@@ -191,9 +169,9 @@
         "title": "AI CLI Diff: Open Pending File"
       },
       {
-        "command": "ai-cli-diff-view.showTerminal",
-        "title": "Back to Terminal",
-        "icon": "$(terminal)"
+        "command": "ai-cli-diff-view.openSettings",
+        "title": "AI CLI Diff: Open Settings",
+        "icon": "$(gear)"
       },
       {
         "command": "ai-cli-diff-view.nextFile",
@@ -229,9 +207,14 @@
     "menus": {
       "view/title": [
         {
-          "command": "ai-cli-diff-view.showTerminal",
-          "when": "view == ai-cli-diff-view.agentChanges && ai-cli-diff-view.terminalFilesPage",
-          "group": "navigation"
+          "command": "ai-cli-diff-view.acceptAllChanges",
+          "when": "view == ai-cli-diff-view.pendingFiles && ai-cli-diff-view.hasPendingDiff",
+          "group": "navigation@1"
+        },
+        {
+          "command": "ai-cli-diff-view.openSettings",
+          "when": "view == ai-cli-diff-view.pendingFiles",
+          "group": "navigation@2"
         }
       ]
     }
