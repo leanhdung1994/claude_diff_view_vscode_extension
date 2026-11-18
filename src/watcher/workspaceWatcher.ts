@@ -71,6 +71,12 @@ export class WorkspaceWatcher {
   /** Directory-create events waiting for one settled subtree reconciliation. */
   private readonly pendingDirectoryScans = new Map<string, NodeJS.Timeout>();
   private static readonly DIRECTORY_SETTLE_MS = 300;
+  /** When a `create` event was last seen per path (see wasCreatedAround). */
+  private readonly recentCreates = new Map<string, number>();
+  /** A create counts for a write whose event came within this much of it. */
+  private static readonly CREATE_MATCH_MS = 2000;
+  /** Long enough to outlive a write queued behind a slow initial baseline scan. */
+  private static readonly RECENT_CREATE_TTL_MS = 10 * 60_000;
   /** Debounce window is 500ms — keep entries an order of magnitude longer for safety, then drop. */
   private static readonly LAST_PROCESSED_TTL_MS = 60_000;
   /** VS Code save guard window is 2s — same safety multiplier. */
@@ -223,6 +229,11 @@ export class WorkspaceWatcher {
         this.savedFilesByVsCode.delete(key);
       }
     }
+    for (const [key, ts] of this.recentCreates) {
+      if (now - ts > WorkspaceWatcher.RECENT_CREATE_TTL_MS) {
+        this.recentCreates.delete(key);
+      }
+    }
     for (const [key, list] of this.ignoredWrites) {
       const kept = list.filter(w => now - w.eventAt <= WorkspaceWatcher.IGNORED_WRITE_TTL_MS);
       if (kept.length === 0) {
@@ -244,6 +255,10 @@ export class WorkspaceWatcher {
       this.handleExternalWrite(uri, 'change');
     });
     fileWatcher.onDidCreate((uri) => {
+      // Record it now, before handleExternalCreate's async stat: a `change`
+      // for the same new file can take the debounce slot meanwhile and drop
+      // this `create`, and it must still count as a new file.
+      this.recentCreates.set(this.normalizePath(uri.fsPath), Date.now());
       void this.handleExternalCreate(uri);
     });
     
@@ -404,7 +419,6 @@ export class WorkspaceWatcher {
     this.pruneStaleMapEntries();
 
     if (!isTextFile(path.basename(absPath))) { return; }
-    if (!this.isInWorkspace(absPath)) { return; }
 
     if (this.baselineScansInProgress > 0) {
       // A file created and then changed while queued is still new: keep
@@ -484,7 +498,7 @@ export class WorkspaceWatcher {
         // unknown (scanner couldn't read it, `files.exclude`, …). Treating it
         // as new would make Revert delete a real file, so only take the
         // current content as its baseline, like the size-skipped case above.
-        if (kind === 'change') { return; }
+        if (kind === 'change' && !this.wasCreatedAround(absPath, eventAt)) { return; }
         // Baseline is already refreshed above; a write the agent didn't make
         // (copying a file in, git, a formatter…) must not open a diff.
         if (!(await this.isAgentWrite(absPath, eventAt, { before: '', existed: false, eventAt }))) { return; }
@@ -519,6 +533,17 @@ export class WorkspaceWatcher {
     } catch {
       // file đang bị lock, không có quyền đọc hoặc đã bị xóa — bỏ qua
     }
+  }
+
+  /**
+   * A `create` event for this path came close to this write's event. Covers a
+   * new file whose `create` lost the debounce slot to its `change`.
+   */
+  private wasCreatedAround(absPath: string, eventAt: number): boolean {
+    const createdAt = this.recentCreates.get(absPath);
+    if (createdAt === undefined) { return false; }
+    this.recentCreates.delete(absPath);
+    return Math.abs(createdAt - eventAt) <= WorkspaceWatcher.CREATE_MATCH_MS;
   }
 
   private async isAgentWrite(absPath: string, eventAt: number, ignored: IgnoredWrite): Promise<boolean> {
@@ -656,12 +681,6 @@ export class WorkspaceWatcher {
     }, this.holdMs);
   }
 
-  private isInWorkspace(filePath: string): boolean {
-    const folders = vscode.workspace.workspaceFolders;
-    if (!folders) { return false; }
-    const normalizedPath = this.normalizePath(filePath);
-    return folders.some(f => normalizedPath.startsWith(this.normalizePath(f.uri.fsPath)));
-  }
 
   /** Cập nhật snapshot khi người dùng tự sửa file (để baseline luôn đúng) */
   updateSnapshot(filePath: string, content: string): void {
@@ -685,5 +704,6 @@ export class WorkspaceWatcher {
     }
     this.heldWrites.clear();
     this.queuedExternalWrites.clear();
+    this.recentCreates.clear();
   }
 }
