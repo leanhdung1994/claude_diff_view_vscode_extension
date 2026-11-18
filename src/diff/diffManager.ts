@@ -12,7 +12,6 @@ import * as vscode from 'vscode';
 import { calculateHunks, Hunk } from './hunkCalculator';
 import { detectEol, fromLf, toLf } from './eol';
 import { detectLanguageId } from './language';
-import { exceedsLineLimit } from '../watcher/fileSizeLimit';
 import { DIFF_EDITOR_VIEW_TYPE } from './diffWebviewPanel';
 import { SnapshotStore, SnapshotState } from './snapshotStore';
 
@@ -86,36 +85,6 @@ export class DiffManager {
   constructor(private readonly context: vscode.ExtensionContext) {
     this.store = new SnapshotStore(context.workspaceState);
     this.snapshots = this.store.load();
-  }
-
-  async snapshotBefore(filePath: string): Promise<void> {
-    const absPath = normalizePath(filePath);
-    if (this.snapshots.has(absPath)) {
-      return;
-    }
-    const uri = vscode.Uri.file(absPath);
-    try {
-      await vscode.workspace.fs.stat(uri);
-    } catch (err) {
-      if (isFileNotFound(err)) {
-        this.snapshots.set(absPath, { content: '', fileExistedBefore: false });
-        void this.store.save(this.snapshots);
-      }
-      return;
-    }
-
-    try {
-      const content = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8');
-      // Đường built-in runner cũng phải tôn trọng maxFileLines, nếu không setting
-      // chỉ đúng với đường workspace watcher. Không snapshot -> openDiff() thoát
-      // sớm vì không có snapshot -> file lớn không mở diff, đúng như mong đợi.
-      if (exceedsLineLimit(content)) { return; }
-      this.snapshots.set(absPath, { content, fileExistedBefore: true });
-    } catch {
-      // File có thể bị xóa hoặc không đọc được sau khi stat — không tạo snapshot rỗng.
-      return;
-    }
-    void this.store.save(this.snapshots);
   }
 
   async openDiff(filePath: string, options?: { preserveFocus?: boolean }): Promise<void> {

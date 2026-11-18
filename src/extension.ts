@@ -1,7 +1,6 @@
 import * as vscode from 'vscode';
 import { DiffManager } from './diff/diffManager';
 import { DiffEditorProvider, DIFF_EDITOR_VIEW_TYPE } from './diff/diffWebviewPanel';
-import { IAiRunner } from './runner/aiRunner';
 import { WorkspaceWatcher } from './watcher/workspaceWatcher';
 import { refreshTextFileRules } from './watcher/fileTypeRules';
 import { refreshFileSizeLimit } from './watcher/fileSizeLimit';
@@ -87,7 +86,6 @@ async function activateExtension(context: vscode.ExtensionContext): Promise<void
   );
   debugLog('activate:navigation webview provider registered');
 
-  let activeRunner: IAiRunner | undefined;
   let agentModePanel: vscode.WebviewPanel | undefined;
   let agentModeTerminal: TerminalPanelProvider | undefined;
   let agentModeTabsState: AgentModeTabsState | undefined;
@@ -116,8 +114,7 @@ async function activateExtension(context: vscode.ExtensionContext): Promise<void
   context.subscriptions.push(
     { dispose: () => diffManager.disposeAll() },
     { dispose: () => workspaceWatcher.dispose() },
-    { dispose: () => gitBranchWatcher.dispose() },
-    { dispose: () => activeRunner?.cancel?.() }
+    { dispose: () => gitBranchWatcher.dispose() }
   );
 
   const restoreStaleAgentModeTabs = async (): Promise<void> => {
@@ -367,8 +364,6 @@ async function activateExtension(context: vscode.ExtensionContext): Promise<void
     diffManager,
     panel: terminalPanel,
     context,
-    getRunner: () => activeRunner,
-    setRunner: (r) => { activeRunner = r; },
     openPendingFileInAgent: (filePath) => (
       agentModeActive && !!agentModeTerminal?.openPendingFileInAgent(filePath)
     ),

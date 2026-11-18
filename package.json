@@ -166,10 +166,6 @@
     },
     "commands": [
       {
-        "command": "ai-cli-diff-view.startSession",
-        "title": "AI CLI Diff: Start Claude Session"
-      },
-      {
         "command": "ai-cli-diff-view.toggleAgentMode",
         "title": "AI CLI Diff: Toggle Agent Mode"
       },
@@ -209,11 +205,6 @@
       }
     ],
     "keybindings": [
-      {
-        "command": "ai-cli-diff-view.startSession",
-        "key": "ctrl+shift+a",
-        "mac": "cmd+shift+a"
-      },
       {
         "command": "ai-cli-diff-view.acceptAllHunks",
         "key": "ctrl+shift+y",

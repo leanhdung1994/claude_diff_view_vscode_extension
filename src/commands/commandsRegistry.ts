@@ -2,81 +2,20 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { DiffManager } from '../diff/diffManager';
 import { TerminalPanelProvider } from '../terminal/terminalPanel';
-import { IAiRunner } from '../runner/aiRunner';
-import { createRunner } from '../runner/runnerFactory';
 
 export interface CommandDeps {
   diffManager: DiffManager;
   panel: TerminalPanelProvider;
   context: vscode.ExtensionContext;
-  getRunner(): IAiRunner | undefined;
-  setRunner(runner: IAiRunner): void;
   openPendingFileInAgent?(filePath: string): boolean;
 }
 
 export function registerAllCommands(deps: CommandDeps): void {
-  const { diffManager, panel, context } = deps;
+  const { diffManager, context } = deps;
 
   function getActiveDiffFilePath(): string | undefined {
     return diffManager.getActiveFilePath() ?? diffManager.getPendingFiles()[0];
   }
-
-  async function ensureRunner(): Promise<IAiRunner | undefined> {
-    if (deps.getRunner()) {
-      return deps.getRunner();
-    }
-
-    try {
-      const result = await createRunner(diffManager);
-      deps.setRunner(result.runner);
-      return result.runner;
-    } catch (err: unknown) {
-      vscode.window.showErrorMessage(err instanceof Error ? err.message : String(err));
-      return undefined;
-    }
-  }
-
-  context.subscriptions.push(
-    vscode.commands.registerCommand('ai-cli-diff-view.startSession', async () => {
-      const workingDir = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
-      const runner = await ensureRunner();
-      if (!runner) {
-        return;
-      }
-
-      const toolLabel = runner.toolName.charAt(0).toUpperCase() + runner.toolName.slice(1);
-      const prompt = await vscode.window.showInputBox({
-        title: `AI CLI Diff: Start ${toolLabel} Session`,
-        prompt: `Enter a prompt for ${toolLabel}`,
-        placeHolder: 'e.g. "Add JSDoc comments to all functions"',
-        ignoreFocusOut: true,
-      });
-      if (!prompt) {
-        return;
-      }
-
-      panel.setRunning(prompt);
-      await vscode.window.withProgress(
-        { location: vscode.ProgressLocation.Notification, title: `AI CLI Diff (${toolLabel})`, cancellable: false },
-        async (progress) => {
-          progress.report({ message: 'Starting session...' });
-          const onProgress = (step: string): void => {
-            progress.report({ message: step });
-          };
-
-          try {
-            await runner.run(prompt, workingDir, () => {}, onProgress);
-            panel.setIdle();
-            vscode.window.showInformationMessage(`${toolLabel} session complete.`);
-          } catch (err: unknown) {
-            const message = err instanceof Error ? err.message : String(err);
-            panel.setError(message);
-            vscode.window.showErrorMessage(`${toolLabel} session failed: ${message}`);
-          }
-        }
-      );
-    })
-  );
 
   context.subscriptions.push(
     vscode.commands.registerCommand('ai-cli-diff-view.openPendingFile', async (filePath?: string) => {
