@@ -464,8 +464,38 @@ export class DiffManager implements vscode.Disposable {
 
   private async closeTabs(tabs: vscode.Tab[]): Promise<void> {
     if (tabs.length === 0) { return; }
+
+    // A diff whose right side has unsaved edits: closing the last editor of
+    // that document would prompt save/discard. Open the file as a plain tab in
+    // the same group first (focus stays put), so the edits stay visible and
+    // nothing prompts. Callers remove the snapshot before closing, so
+    // autoRouteTab doesn't send the new tab back into a diff.
+    const dirty = tabs.filter((tab) => tab.isDirty && isPendingDiffInput(tab.input));
+    for (const tab of dirty) {
+      try {
+        await vscode.window.showTextDocument((tab.input as vscode.TabInputTextDiff).modified, {
+          viewColumn: tab.group.viewColumn,
+          preserveFocus: true,
+          preview: false,
+        });
+      } catch (err) {
+        console.error('[ai-cli-diff] keeping unsaved edits open failed:', err);
+      }
+    }
+
+    // Opening tabs changed the tab model; look the diff tabs up again rather
+    // than closing possibly stale Tab objects.
+    let targets = tabs;
+    if (dirty.length > 0) {
+      const keyOf = (tab: vscode.Tab): string => (
+        `${tab.group.viewColumn}|${normalizePath((tab.input as vscode.TabInputTextDiff).modified.fsPath)}`
+      );
+      const wanted = new Set(tabs.map(keyOf));
+      targets = this.allDiffTabs().filter((tab) => wanted.has(keyOf(tab)));
+    }
+
     try {
-      await vscode.window.tabGroups.close(tabs);
+      await vscode.window.tabGroups.close(targets);
     } catch (err) {
       console.error('[ai-cli-diff] closing diff tabs failed:', err);
     }
