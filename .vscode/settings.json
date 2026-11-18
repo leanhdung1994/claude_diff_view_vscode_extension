@@ -1,4 +1,4 @@
 {
     "diffEditor.codeLens": true,
-    "workbench.editor.showTabs": "multiple"
+    "workbench.editor.showTabs": "none"
 }
