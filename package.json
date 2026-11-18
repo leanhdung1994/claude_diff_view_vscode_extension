@@ -37,14 +37,9 @@
           "default": "allExternalWrites",
           "enumDescriptions": [
             "Treat every write made outside VS Code as an agent edit. Works with any CLI (Claude, Codex, Qwen) but also picks up files you copy in, git operations, formatters, etc.",
-            "Claude Code only: install a PreToolUse/PostToolUse/Stop hook in ~/.claude/settings.json and open diffs only for files Claude Code actually edited. Other writes just refresh the baseline."
+            "Claude Code only: install UserPromptSubmit/Stop hooks in ~/.claude/settings.json. Every file change made during a Claude turn (from your message until Claude stops) opens a diff; other changes just refresh the baseline. Assumes nothing else writes workspace files while Claude is working."
           ],
           "markdownDescription": "How AI CLI Diff View decides that a file change was made by the agent. Switching to `claudeCodeHooks` writes a small hook into `~/.claude/settings.json` (removed again when you switch back). Restart running Claude sessions after switching."
-        },
-        "ai-cli-diff-view.claudeHooks.attributeBashWrites": {
-          "type": "boolean",
-          "default": true,
-          "markdownDescription": "With `claudeCodeHooks`: while Claude is running a `Bash` command (e.g. `sed -i`, `cat > file`, codegen), attribute any workspace write during that command to Claude. Turn off to only track `Write`/`Edit`/`MultiEdit`/`NotebookEdit` — fewer false positives, but shell edits are missed."
         },
         "ai-cli-diff-view.supportedFileDetectionMode": {
           "type": "string",

@@ -54,7 +54,7 @@ This is the most important thing to understand and the biggest divergence from o
 
 ### Two edit-detection pipelines
 
-There used to be a third, hook-based pipeline (`PreToolUse`/`PostToolUse` hooks written into `~/.claude/settings.json`); it was removed in favor of detecting every CLI — including Claude — uniformly through the workspace watcher. Only the unrelated `Notification`/`Stop` sound hooks remain (see Sound notifications below), and they carry no diff-detection role.
+Every CLI — including Claude — is detected through the workspace watcher. By default (`editAttribution = allExternalWrites`) every external write is treated as an agent edit. The opt-in Claude turn-window mode below only *filters* the watcher's writes; it is not a separate detection pipeline.
 
 **Workspace watcher (primary path for all external AI CLIs)**
 
@@ -63,6 +63,16 @@ There used to be a third, hook-based pipeline (`PreToolUse`/`PostToolUse` hooks 
 **Built-in runner (Claude-only)**
 
 `src/runner/runnerFactory.ts` detects whether `claude` is on PATH and returns a `ClaudeRunner` (`src/runner/claudeRunner.ts`), which spawns `claude` with stream-json output, snapshots files before `Write`/`Edit`/`MultiEdit`, and opens diffs when results arrive. `src/runner/aiRunner.ts` is the runner interface. Note this is the programmatic runner used by `startSession`; it is distinct from the interactive integrated terminal below.
+
+### Claude turn-window attribution (opt-in, `editAttribution = claudeCodeHooks`)
+
+`src/attribution/` decides whether an external write was Claude's, so files you copy in, git, formatters etc. don't open diffs. `claudeHookInstaller.ts` adds one `UserPromptSubmit` and one `Stop` hook to `~/.claude/settings.json` (timeout 30 s; the hook copies its stdin JSON into `~/.ai-cli-diff-view/claude-events/` and must print nothing, because `UserPromptSubmit` stdout reaches Claude's context). It owns only entries whose command contains both `ai-cli-diff-view` and `claude-events`, and also removes such entries under `PreToolUse`/`PostToolUse` left by the earlier per-edit design.
+
+- **Rule** (`claudeAttribution.ts`, no `vscode` import): a write is Claude's if `turn.start ≤ writeAt ≤ (turn.end ?? start + 3 h) + 10 s` for a turn whose `cwd` is the same as, inside, or a parent of the file's workspace folder (both sides realpath'd, so a mapped drive matches its UNC path). A new `UserPromptSubmit` closes the session's previous open turn.
+- **Why turns, not per-edit events:** the watcher overwrites its baseline *before* asking the gate, so a write wrongly judged "not Claude's" loses its before-image. Claude Code waits for `UserPromptSubmit` before Claude starts, so the turn is always on record by the time the watcher decides (~200 ms after the write), even when the change notice is late.
+- **Recovery:** `WorkspaceWatcher` keeps the before-image of every ignored write (`ignoredWrites`). If a `Stop` arrives for a session with no open turn (its turn-start hook failed), `setupClaudeAttribution.ts` asks the watcher to open diffs for that session's ignored writes since its previous `Stop`. `ClaudeHookSource` polls the events folder every 2 s while the mode is on so this happens when the turn ends; its reads are serialized (overlapping reads would ingest one `Stop` twice) and it catches up on the last 30 min of events at startup.
+- **Assumptions:** nothing but Claude writes workspace files during a Claude turn, and turns are not interrupted with Esc (no `Stop` fires; the turn stays open until the next message or 3 h).
+- Tests: `npm run compile && node scripts/test-attribution.js` (includes running the real hook command).
 
 ### Sound notifications (unrelated to diff detection)
 
@@ -97,6 +107,7 @@ Pending-file navigation logic lives in `src/diff/navigationManager.ts`, reachabl
 
 | Setting | Purpose |
 | --- | --- |
+| `ai-cli-diff-view.editAttribution` | `allExternalWrites` (default: every external write is an agent edit) or `claudeCodeHooks` (Claude turn-window attribution; installs hooks in `~/.claude/settings.json`) |
 | `ai-cli-diff-view.supportedFileDetectionMode` | `defaultAndCustom` (default) or `customOnly` |
 | `ai-cli-diff-view.supportedFileExtensions` | Extra extensions to treat as text (dot optional) |
 | `ai-cli-diff-view.supportedFilenames` | Extra exact filenames to treat as text |

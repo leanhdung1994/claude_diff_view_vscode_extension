@@ -1,11 +1,16 @@
 /**
  * claudeHookInstaller.ts
  *
- * Adds/removes the attribution hooks in ~/.claude/settings.json.
+ * Adds/removes the attribution hooks in ~/.claude/settings.json: one
+ * `UserPromptSubmit` and one `Stop` hook, which mark the start and end of each
+ * Claude turn (see claudeAttribution.ts).
  *
  * The hook itself is deliberately dumb: it copies Claude Code's hook stdin JSON
  * into one file under ~/.ai-cli-diff-view/claude-events/. No Python/Node needed;
  * all parsing happens in the extension (claudeAttribution.ts).
+ *
+ * The hook must print NOTHING to stdout: for `UserPromptSubmit`, Claude Code
+ * adds stdout to Claude's context.
  *
  * Rules learned from claudegate (docs/2026-07-06-hook-not-firing-in-running-session-bug.md):
  *  - Only rewrite settings.json on a SEMANTIC change. Running Claude sessions
@@ -20,7 +25,14 @@ import * as path from 'path';
 
 const EVENTS_MARKER = 'claude-events';
 const OWNER_MARKER = 'ai-cli-diff-view';
-export const TOOL_MATCHER = '^(Write|Edit|MultiEdit|NotebookEdit|Bash)$';
+/** Generous: a slow PowerShell start must never lose a turn-start event. */
+const HOOK_TIMEOUT_S = 30;
+/**
+ * Every hook event this extension has ever installed an entry for. Our entries
+ * under any of them are removed when no longer wanted — this is what cleans up
+ * the PreToolUse/PostToolUse entries of the earlier per-edit design on upgrade.
+ */
+const OWNED_EVENTS = ['PreToolUse', 'PostToolUse', 'UserPromptSubmit', 'Stop'] as const;
 
 export function getClaudeEventsDir(): string {
   return path.join(os.homedir(), '.ai-cli-diff-view', EVENTS_MARKER);
@@ -50,7 +62,7 @@ function hookCommand(platform: string): HookCommand {
     return {
       type: 'command',
       shell: 'powershell',
-      timeout: 5,
+      timeout: HOOK_TIMEOUT_S,
       command: [
         `$d=Join-Path $env:USERPROFILE '.${OWNER_MARKER}\\${EVENTS_MARKER}'`,
         'New-Item -ItemType Directory -Force -Path $d | Out-Null',
@@ -64,7 +76,7 @@ function hookCommand(platform: string): HookCommand {
   // Write to a temp name then rename, so the extension never reads half a file.
   return {
     type: 'command',
-    timeout: 5,
+    timeout: HOOK_TIMEOUT_S,
     command:
       `d="$HOME/.${OWNER_MARKER}/${EVENTS_MARKER}"; mkdir -p "$d" && t="$d/.$$.tmp" && ` +
       `cat > "$t" && mv "$t" "$d/$(date +%s)-$$.json"; exit 0`,
@@ -77,11 +89,10 @@ function isOurs(group: HookGroup): boolean {
   );
 }
 
-function desiredGroups(platform: string): Record<string, HookGroup> {
+function desiredGroups(platform: string): Partial<Record<string, HookGroup>> {
   const cmd = hookCommand(platform);
   return {
-    PreToolUse: { matcher: TOOL_MATCHER, hooks: [cmd] },
-    PostToolUse: { matcher: TOOL_MATCHER, hooks: [cmd] },
+    UserPromptSubmit: { hooks: [cmd] },
     Stop: { hooks: [cmd] },
   };
 }
@@ -124,10 +135,12 @@ export function computeHookSettings(
     ? { ...(settings['hooks'] as Record<string, unknown>) }
     : {};
 
-  for (const [eventName, group] of Object.entries(desiredGroups(platform))) {
+  const desired = desiredGroups(platform);
+  for (const eventName of OWNED_EVENTS) {
     const list = Array.isArray(hooks[eventName]) ? (hooks[eventName] as HookGroup[]) : [];
     const others = list.filter(g => !isOurs(g));
-    const next = enabled ? [...others, group] : others;
+    const group = desired[eventName];
+    const next = enabled && group ? [...others, group] : others;
     if (next.length > 0) {
       hooks[eventName] = next;
     } else {

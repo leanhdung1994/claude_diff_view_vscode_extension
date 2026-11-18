@@ -4,10 +4,15 @@
  * Reads the event files the Claude Code hook drops into
  * ~/.ai-cli-diff-view/claude-events/ and feeds them to ClaudeAttribution.
  *
- * Pull-based on purpose: WorkspaceWatcher asks right before deciding about a
- * write (which is already ≥200ms after the FS event). The PreToolUse hook ran
- * synchronously BEFORE Claude's write, so its event file is always on disk by
- * then — no race between two independent watchers.
+ * Read on demand: WorkspaceWatcher asks right before deciding about a write
+ * (≥200ms after the FS event). The `UserPromptSubmit` hook ran before Claude
+ * started working, so the turn's start is always on disk by then. A slow
+ * polling timer (start()) additionally picks up `Stop` events promptly, so a
+ * missed turn start is noticed when the turn ends, not at the next write.
+ *
+ * Reads are serialized: two overlapping reads would both see the same new file
+ * before either marks it as seen, and ingest it twice (a second `Stop` would
+ * then look like a Stop without a turn start).
  *
  * The directory is shared by every VS Code window, so files are never consumed;
  * each window remembers what it has read and old files are deleted by age.
@@ -24,8 +29,10 @@ const CLEANUP_INTERVAL_MS = 60_000;
 export class ClaudeHookSource {
   private readonly seen = new Set<string>();
   private lastCleanup = 0;
-  /** Ignore events written before this window started (stale leftovers). */
-  private readonly startedAt = Date.now() - 60_000;
+  /** When this window started reading; older events are history (startup catch-up). */
+  private readonly createdAt = Date.now();
+  private chain: Promise<void> = Promise.resolve();
+  private pendingReads = 0;
 
   constructor(
     private readonly attribution: ClaudeAttribution,
@@ -41,7 +48,24 @@ export class ClaudeHookSource {
     return this.attribution.hasSeenAnyEvent();
   }
 
-  private async refresh(): Promise<void> {
+  /** Read new event files. Calls are queued, never overlap. */
+  refresh(): Promise<void> {
+    this.pendingReads++;
+    const run = this.chain.then(() => this.doRefresh());
+    this.chain = run.catch(() => {}).then(() => { this.pendingReads--; });
+    return run;
+  }
+
+  /** Poll the events folder every `intervalMs` until disposed. */
+  start(intervalMs = 2000): { dispose(): void } {
+    const timer = setInterval(() => {
+      if (this.pendingReads === 0) { void this.refresh().catch(() => {}); }
+    }, intervalMs);
+    timer.unref?.();
+    return { dispose: () => clearInterval(timer) };
+  }
+
+  private async doRefresh(): Promise<void> {
     let names: string[];
     try {
       names = await fs.promises.readdir(this.eventsDir);
@@ -63,7 +87,9 @@ export class ClaudeHookSource {
       }
       try {
         const stat = await fs.promises.stat(full);
-        if (stat.mtimeMs < this.startedAt) {
+        // Catch up on the last FILE_MAX_AGE_MS at startup, so a turn that
+        // started before this window opened is known when its Stop arrives.
+        if (now - stat.mtimeMs > FILE_MAX_AGE_MS) {
           this.seen.add(name);
           if (doCleanup) { await this.deleteIfOld(full, name, now); }
           continue;
@@ -75,12 +101,12 @@ export class ClaudeHookSource {
       }
     }
 
-    // Pre must be ingested before its Post.
+    // A turn's start must be ingested before its Stop.
     fresh.sort((a, b) => a.at - b.at);
     for (const f of fresh) {
       this.seen.add(f.name);
       const evt = parseHookEvent(f.raw, f.at);
-      if (evt) { this.attribution.ingest(evt); }
+      if (evt) { this.attribution.ingest(evt, f.at < this.createdAt); }
     }
     this.attribution.prune(now);
   }

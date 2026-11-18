@@ -37,6 +37,19 @@ export interface EditAttribution {
   isAgentWrite(absPath: string, eventAt: number): Promise<boolean>;
   /** Called when a real change was ignored as not-the-agent's. */
   onIgnoredWrite?(absPath: string): void;
+  /**
+   * Lets the gate reclaim writes it wrongly ignored (e.g. Claude's turn-start
+   * hook failed, noticed only at its Stop). The handler opens diffs for every
+   * remembered ignored write that `match` accepts and returns how many.
+   */
+  setRecoveryHandler?(handler: (match: (absPath: string, eventAt: number) => boolean) => Promise<number>): void;
+}
+
+/** Before-image of a write the attribution gate ignored, kept for recovery. */
+interface IgnoredWrite {
+  before: string;
+  existed: boolean;
+  eventAt: number;
 }
 
 export class WorkspaceWatcher {
@@ -74,6 +87,16 @@ export class WorkspaceWatcher {
   private lastAutoOpenActivityAt = 0;
   /** Khoảng cách tối thiểu giữa 2 write để coi là 2 cụm khác nhau (và ghi lại hint activeTab mới). */
   private static readonly ACTIVE_TAB_CAPTURE_GAP_MS = 500;
+  /**
+   * Writes the attribution gate judged not-the-agent's, oldest first per file.
+   * The baseline has already moved past them, so this is the only copy of their
+   * before-image if the gate later reclaims them (see recoverIgnoredWrites).
+   */
+  private readonly ignoredWrites = new Map<string, IgnoredWrite[]>();
+  /** Longest a Claude turn can stay open (3 h) plus margin. */
+  private static readonly IGNORED_WRITE_TTL_MS = 3 * 60 * 60_000 + 60_000;
+  private static readonly IGNORED_WRITE_MAX_FILES = 500;
+  private static readonly IGNORED_WRITE_MAX_PER_FILE = 20;
 
   constructor(
     private readonly diffManager: DiffManager,
@@ -82,6 +105,7 @@ export class WorkspaceWatcher {
   ) {
     this.snapshots = new BaselineStore();
     this.baselineScanner = new BaselineScanner(this.snapshots);
+    this.attribution?.setRecoveryHandler?.(match => this.recoverIgnoredWrites(match));
   }
 
   start(): void {
@@ -133,6 +157,8 @@ export class WorkspaceWatcher {
       this.holdResolveTimer = undefined;
     }
     this.heldWrites.clear();
+    // Baseline is rebuilt from the new working tree; old before-images are stale.
+    this.ignoredWrites.clear();
     for (const folder of vscode.workspace.workspaceFolders ?? []) {
       void this.watchFolder(folder.uri.fsPath).catch(() => {
         // ignore — sẽ tự rebuild dần qua các event sau
@@ -171,6 +197,9 @@ export class WorkspaceWatcher {
         this.snapshots.set(filePath, text);
       }
       this.savedFilesByVsCode.set(filePath, Date.now());
+      // The user edited the file in VS Code: an older ignored write's
+      // before-image would now fold the user's edit into a recovered diff.
+      this.ignoredWrites.delete(filePath);
       this.pruneStaleMapEntries();
     });
     this.disposables.push(d);
@@ -186,6 +215,14 @@ export class WorkspaceWatcher {
     for (const [key, ts] of this.savedFilesByVsCode) {
       if (now - ts > WorkspaceWatcher.SAVED_BY_VSCODE_TTL_MS) {
         this.savedFilesByVsCode.delete(key);
+      }
+    }
+    for (const [key, list] of this.ignoredWrites) {
+      const kept = list.filter(w => now - w.eventAt <= WorkspaceWatcher.IGNORED_WRITE_TTL_MS);
+      if (kept.length === 0) {
+        this.ignoredWrites.delete(key);
+      } else if (kept.length !== list.length) {
+        this.ignoredWrites.set(key, kept);
       }
     }
   }
@@ -433,7 +470,7 @@ export class WorkspaceWatcher {
         if (this.snapshots.consumeSizeSkipped(absPath)) { return; }
         // Baseline is already refreshed above; a write the agent didn't make
         // (copying a file in, git, a formatter…) must not open a diff.
-        if (!(await this.isAgentWrite(absPath, eventAt))) { return; }
+        if (!(await this.isAgentWrite(absPath, eventAt, { before: '', existed: false, eventAt }))) { return; }
         // A new empty file still needs a pending snapshot: accepting keeps it,
         // while reverting removes it. It has no content hunk to render.
         this.resolveOrHold(absPath, '', newContentRaw, false, burstHold);
@@ -454,7 +491,7 @@ export class WorkspaceWatcher {
       this.snapshots.set(absPath, newContentRaw);
 
       if (!this.diffManager.hasPendingDiff(absPath)) {
-        if (!(await this.isAgentWrite(absPath, eventAt))) { return; }
+        if (!(await this.isAgentWrite(absPath, eventAt, { before: oldContentRaw!, existed: true, eventAt }))) { return; }
         this.resolveOrHold(absPath, oldContentRaw!, newContentRaw, true, burstHold);
       }
     } catch {
@@ -462,15 +499,60 @@ export class WorkspaceWatcher {
     }
   }
 
-  private async isAgentWrite(absPath: string, eventAt: number): Promise<boolean> {
+  private async isAgentWrite(absPath: string, eventAt: number, ignored: IgnoredWrite): Promise<boolean> {
     if (!this.attribution?.isEnabled()) { return true; }
     try {
       if (await this.attribution.isAgentWrite(absPath, eventAt)) { return true; }
     } catch {
       return true; // fail open: a broken gate must not hide agent edits
     }
+    this.rememberIgnoredWrite(absPath, ignored);
     this.attribution.onIgnoredWrite?.(absPath);
     return false;
+  }
+
+  private rememberIgnoredWrite(absPath: string, write: IgnoredWrite): void {
+    const list = this.ignoredWrites.get(absPath);
+    if (list) {
+      list.push(write);
+      if (list.length > WorkspaceWatcher.IGNORED_WRITE_MAX_PER_FILE) { list.shift(); }
+      return;
+    }
+    if (this.ignoredWrites.size >= WorkspaceWatcher.IGNORED_WRITE_MAX_FILES) {
+      // Map iterates in insertion order: drop the file remembered longest ago.
+      const oldest = this.ignoredWrites.keys().next().value;
+      if (oldest !== undefined) { this.ignoredWrites.delete(oldest); }
+    }
+    this.ignoredWrites.set(absPath, [write]);
+  }
+
+  /**
+   * Open diffs for remembered ignored writes that the gate now reclaims. For
+   * each file, the earliest matching write's before-image is the left side and
+   * the file on disk is the right side.
+   */
+  private async recoverIgnoredWrites(match: (absPath: string, eventAt: number) => boolean): Promise<number> {
+    let opened = 0;
+    for (const [absPath, list] of Array.from(this.ignoredWrites)) {
+      const hit = list.find(w => match(absPath, w.eventAt));
+      if (!hit) { continue; }
+      this.ignoredWrites.delete(absPath);
+      if (this.diffManager.hasPendingDiff(absPath)) { continue; }
+
+      let current: string;
+      try {
+        current = Buffer.from(await vscode.workspace.fs.readFile(vscode.Uri.file(absPath))).toString('utf8');
+      } catch {
+        continue; // deleted since — nothing to show
+      }
+      if (exceedsLineLimit(current)) { continue; }
+      if (hit.existed && this.normalizeContent(current) === this.normalizeContent(hit.before)) { continue; }
+      // The write may have arrived while this was reading the file.
+      if (this.diffManager.hasPendingDiff(absPath)) { continue; }
+      this.resolveOrHold(absPath, hit.before, current, hit.existed, false);
+      opened++;
+    }
+    return opened;
   }
 
   private triggerDiff(
@@ -480,6 +562,8 @@ export class WorkspaceWatcher {
     fileExistedBefore: boolean,
     fromBurstDump = false
   ): void {
+    // The open diff now owns this file's before-image.
+    this.ignoredWrites.delete(filePath);
     this.diffManager.loadSnapshot(filePath, originalContent, fileExistedBefore);
     // Agent Mode owns review in its central preview. Keep the pending snapshot
     // so its changes sidebar refreshes, but never steal the main editor focus.

@@ -5,51 +5,118 @@ const I = require('../out/attribution/claudeHookInstaller');
 const S = require('../out/attribution/claudeHookSource');
 let pass = 0; const ok = (c, m) => { assert(c, m); pass++; console.log('  ✓', m); };
 
-const ev = (event, tool, id, input, at, sid='s1') => A.parseHookEvent(JSON.stringify({
-  hook_event_name: event, tool_name: tool, tool_use_id: id, session_id: sid, cwd: '/ws', tool_input: input }), at);
+const n = p => A.normalizeFsPath(p);
+const ev = (event, at, { sid = 's1', cwd = '/ws' } = {}) => A.parseHookEvent(JSON.stringify({
+  hook_event_name: event, session_id: sid, cwd }), at);
+const make = (opts = {}) => new A.ClaudeAttribution({ workspaceFolders: () => [n('/ws')], ...opts });
+const GRACE = A.DEFAULT_TIMINGS.stopGraceMs;
 
-console.log('Attribution logic');
+console.log('Turn window');
 {
-  const a = new A.ClaudeAttribution();
-  ok(!a.isClaudeWrite('/ws/copied.txt', 1000), 'file copied in with no hook events → NOT Claude (the reported bug)');
-  a.ingest(ev('PreToolUse', 'Write', 't1', { file_path: '/ws/a.ts' }, 1000));
-  ok(a.isClaudeWrite('/ws/a.ts', 1200), 'Write target during tool → Claude');
-  ok(!a.isClaudeWrite('/ws/copied.txt', 1200), 'other file during a Write → NOT Claude');
-  a.ingest(ev('PostToolUse', 'Write', 't1', { file_path: '/ws/a.ts' }, 1300));
-  ok(a.isClaudeWrite('/ws/a.ts', 3000), 'watcher event arriving shortly after PostToolUse → Claude (grace)');
-  ok(!a.isClaudeWrite('/ws/a.ts', 60000), 'later write by user to same file → NOT Claude');
-  ok(!a.isClaudeWrite('/ws/a.ts', 500), 'write before PreToolUse → NOT Claude');
+  const a = make();
+  ok(!a.isClaudeWrite('/ws/copied.txt', 1000), 'no turn → file copied in is NOT Claude');
+  a.ingest(ev('UserPromptSubmit', 1000));
+  ok(a.isClaudeWrite('/ws/a.ts', 1500), 'write during the turn → Claude');
+  ok(!a.isClaudeWrite('/ws/a.ts', 999), 'write before the turn start → NOT Claude');
+  a.ingest(ev('Stop', 5000));
+  ok(a.isClaudeWrite('/ws/a.ts', 5000 + GRACE), 'change notice within the grace after Stop → Claude');
+  ok(!a.isClaudeWrite('/ws/a.ts', 5000 + GRACE + 1), 'write after Stop + grace → NOT Claude');
 }
 {
-  const a = new A.ClaudeAttribution();
-  a.ingest(ev('PreToolUse', 'Edit', 't2', { file_path: 'src/b.ts' }, 1000));
-  ok(a.isClaudeWrite(path.resolve('/ws/src/b.ts'), 1100), 'relative file_path resolved against cwd');
+  const a = make();
+  a.ingest(ev('UserPromptSubmit', 1000));
+  a.ingest(ev('PreToolUse', 1200)); // leftover per-edit event: ignored
+  ok(a.isClaudeWrite('/ws/doc.qmd', 3000) && a.isClaudeWrite('/ws/doc.qmd', 3400),
+    'two quick writes to one file with no per-edit events → both Claude (the reported bug)');
+  ok(a.isClaudeWrite('/ws/doc.qmd', 20000), 'late change notice inside a long turn → Claude');
 }
 {
-  const a = new A.ClaudeAttribution();
-  a.ingest(ev('PreToolUse', 'Bash', 'b1', { command: "sed -i 's/x/y/' f.ts" }, 1000));
-  ok(a.isClaudeWrite('/ws/f.ts', 1500), 'write during Bash command → Claude');
-  a.ingest(ev('PostToolUse', 'Bash', 'b1', { command: '...' }, 2000));
-  ok(!a.isClaudeWrite('/ws/copied.txt', 20000), 'copy after Bash finished → NOT Claude');
+  const a = make();
+  ok(A.parseHookEvent(JSON.stringify({ hook_event_name: 'PostToolUse', tool_name: 'Edit' }), 1) !== undefined,
+    'leftover PostToolUse event parses');
+  a.ingest(ev('PreToolUse', 1000));
+  a.ingest(ev('PostToolUse', 1100));
+  ok(!a.isClaudeWrite('/ws/a.ts', 1050), 'PreToolUse/PostToolUse alone open no turn');
+}
+
+console.log('Workspace filter');
+{
+  const a = make({ workspaceFolders: () => [n('/ws/proj')] });
+  a.ingest(ev('UserPromptSubmit', 1000, { sid: 'other', cwd: '/elsewhere' }));
+  ok(!a.isClaudeWrite('/ws/proj/a.ts', 1500), 'turn of a session in another project does not cover this workspace');
+  a.ingest(ev('UserPromptSubmit', 2000, { sid: 'parent', cwd: '/ws' }));
+  ok(a.isClaudeWrite('/ws/proj/a.ts', 2500), 'turn whose cwd is a parent of the workspace folder covers it');
 }
 {
-  const a = new A.ClaudeAttribution(undefined, () => false);
-  a.ingest(ev('PreToolUse', 'Bash', 'b1', { command: 'x' }, 1000));
-  ok(!a.isClaudeWrite('/ws/f.ts', 1500), 'Bash attribution disabled → shell writes not attributed');
+  const a = make({ workspaceFolders: () => [n('/ws/proj')] });
+  a.ingest(ev('UserPromptSubmit', 1000, { cwd: '/ws/proj/sub' }));
+  ok(a.isClaudeWrite('/ws/proj/a.ts', 1500), 'turn whose cwd is inside the workspace folder covers it');
 }
 {
-  const a = new A.ClaudeAttribution();
-  a.ingest(ev('PreToolUse', 'Bash', 'b1', { command: 'x' }, 1000)); // denied: no Post
-  a.ingest(A.parseHookEvent(JSON.stringify({ hook_event_name: 'Stop', session_id: 's1' }), 5000));
-  ok(!a.isClaudeWrite('/ws/copied.txt', 30000), 'denied Bash (no Post) closed by Stop at end of turn');
+  // Mapped drive vs UNC path: both sides resolve to the same real path.
+  const real = p => n(p).replace(n('/alias'), n('/real'));
+  const a = make({ workspaceFolders: () => [n('/real/ws')], canonicalize: real });
+  a.ingest(ev('UserPromptSubmit', 1000, { cwd: '/alias/ws' }));
+  ok(a.isClaudeWrite('/real/ws/a.ts', 1500), 'cwd and folder compared after canonicalize (P:\\ vs \\\\server\\share)');
+  ok(a.cwdMatchesWorkspace(n('/alias/ws')) && !a.cwdMatchesWorkspace(n('/elsewhere')), 'cwdMatchesWorkspace');
 }
 {
-  const a = new A.ClaudeAttribution();
-  a.ingest(ev('PreToolUse', 'Read', 'r1', { file_path: '/ws/a.ts' }, 1000));
-  ok(!a.isClaudeWrite('/ws/a.ts', 1100), 'Read tool never attributes');
+  let mismatch = 0;
+  const a = make({ onCwdMismatch: () => mismatch++ });
+  a.ingest(ev('UserPromptSubmit', 1000, { cwd: '/elsewhere' }));
+  a.isClaudeWrite('/ws/a.ts', 1500);
+  ok(mismatch === 1, 'cwd mismatch is reported (for the log)');
+}
+
+console.log('Turn lifecycle');
+{
+  const a = make();
+  a.ingest(ev('UserPromptSubmit', 1000)); // its Stop never arrives
+  a.ingest(ev('UserPromptSubmit', 5000));
+  a.ingest(ev('Stop', 6000));
+  ok(!a.isClaudeWrite('/ws/a.ts', 6000 + GRACE + 1), 'missed Stop: the next turn start closes the earlier turn');
+}
+{
+  const a = make({ timings: { stopGraceMs: 100, maxOpenMs: 10_000 } });
+  a.ingest(ev('UserPromptSubmit', 1000));
+  ok(a.isClaudeWrite('/ws/a.ts', 11_100), 'open turn with no Stop still covers writes up to maxOpen + grace');
+  ok(!a.isClaudeWrite('/ws/a.ts', 11_101), 'open turn with no Stop expires after maxOpen + grace');
+  a.prune(11_101 + 60_001);
+  ok(!a.isClaudeWrite('/ws/a.ts', 5000), 'expired turn is pruned');
+}
+{
+  const a = make();
+  a.ingest(ev('UserPromptSubmit', 1000));
+  a.prune(2_000_000);
+  ok(a.isClaudeWrite('/ws/a.ts', 2_000_000), 'prune keeps an open turn that is still in its window');
+}
+{
+  const a = make();
+  a.ingest(ev('UserPromptSubmit', 1000, { sid: 'x' }));
+  a.ingest(ev('UserPromptSubmit', 1000, { sid: 'y' }));
+  a.ingest(A.parseHookEvent(JSON.stringify({ hook_event_name: 'Stop' }), 2000));
+  ok(!a.isClaudeWrite('/ws/a.ts', 2000 + GRACE + 1), 'Stop without session_id closes every open turn');
+}
+{
+  const calls = [];
+  const a = make({ onStopWithoutStart: info => calls.push(info) });
+  a.ingest(ev('UserPromptSubmit', 1000));
+  a.ingest(ev('Stop', 2000));
+  ok(calls.length === 0, 'normal turn: no missed-start report');
+  a.ingest(ev('Stop', 9000)); // turn start hook failed
+  ok(calls.length === 1 && calls[0].since === 2000 && calls[0].at === 9000 && calls[0].sessionId === 's1',
+    'Stop without turn start is reported with the previous Stop as `since`');
+  a.ingest(ev('Stop', 12000), true);
+  ok(calls.length === 1, 'historical Stop (startup catch-up) is never reported');
+}
+
+console.log('Parsing');
+{
   ok(A.parseHookEvent('\uFEFF{"hook_event_name":"Stop"}', 1) !== undefined, 'BOM-prefixed payload parses');
   ok(A.parseHookEvent('garbage', 1) === undefined, 'garbage payload ignored');
+  ok(A.parseHookEvent('{"hook_event_name":"Notification"}', 1) === undefined, 'unknown event ignored');
   ok(A.normalizeFsPath('C:\\Proj\\A.ts', 'win32') === A.normalizeFsPath('C:\\Proj\\A.ts', 'win32').toLowerCase(), 'win32 paths lowercased');
+  ok(A.isInside(n('/ws/a'), n('/ws')) && !A.isInside(n('/wsx/a'), n('/ws')), 'isInside respects path boundaries');
 }
 
 console.log('settings.json installer');
@@ -61,11 +128,35 @@ console.log('settings.json installer');
   const r1 = I.computeHookSettings(raw, true, 'linux');
   const s1 = JSON.parse(r1.content);
   ok(r1.changed, 'install changes settings');
-  ok(s1.model === 'opus' && s1.hooks.PreToolUse.length === 2 && s1.hooks.Stop.length === 2, 'user hooks + other settings preserved');
-  ok(s1.hooks.PostToolUse[0].matcher === I.TOOL_MATCHER, 'PostToolUse registered with matcher');
+  ok(s1.model === 'opus' && s1.hooks.PreToolUse.length === 1 && s1.hooks.Stop.length === 2,
+    'user hooks + other settings preserved');
+  ok(!s1.hooks.PostToolUse, 'no PostToolUse hook installed');
+  const ups = s1.hooks.UserPromptSubmit;
+  ok(ups.length === 1 && ups[0].matcher === undefined && ups[0].hooks[0].timeout === 30,
+    'UserPromptSubmit installed without matcher, timeout 30');
+  ok(s1.hooks.Stop[1].hooks[0].timeout === 30, 'Stop installed with timeout 30');
   ok(!I.computeHookSettings(r1.content, true, 'linux').changed, 'second install is a no-op (no rewrite)');
   const r3 = JSON.parse(I.computeHookSettings(r1.content, false, 'linux').content);
   ok(JSON.stringify(r3) === JSON.stringify(user), 'uninstall restores exactly the original config');
+
+  // Upgrade from the per-edit design: our old PreToolUse/PostToolUse entries go.
+  const oldCmd = { type: 'command', timeout: 5,
+    command: 'd="$HOME/.ai-cli-diff-view/claude-events"; mkdir -p "$d" && cat > "$d/x.json"; exit 0' };
+  const oldMatcher = '^(Write|Edit|MultiEdit|NotebookEdit|Bash)$';
+  const old = JSON.parse(raw);
+  old.hooks.PreToolUse.push({ matcher: oldMatcher, hooks: [oldCmd] });
+  old.hooks.PostToolUse = [{ matcher: oldMatcher, hooks: [oldCmd] }];
+  old.hooks.Stop.push({ hooks: [oldCmd] });
+  const up = I.computeHookSettings(JSON.stringify(old, null, 2), true, 'linux');
+  const su = JSON.parse(up.content);
+  ok(up.changed && su.hooks.PreToolUse.length === 1 && su.hooks.PreToolUse[0].hooks[0].command === 'my-guard.sh',
+    'upgrade removes our old PreToolUse entry, keeps the user\'s');
+  ok(!su.hooks.PostToolUse, 'upgrade removes our old PostToolUse entry');
+  ok(su.hooks.Stop.length === 2 && su.hooks.Stop[1].hooks[0].timeout === 30, 'upgrade replaces our old Stop entry');
+  ok(su.hooks.UserPromptSubmit.length === 1, 'upgrade adds UserPromptSubmit');
+  ok(JSON.stringify(JSON.parse(I.computeHookSettings(JSON.stringify(old), false, 'linux').content)) === JSON.stringify(user),
+    'uninstall over the old version also restores the original config');
+
   ok(I.computeHookSettings('{ broken', true, 'linux').parseError, 'malformed settings.json → refuse to write');
   {
     const r = I.computeHookSettings('{ broken', false, 'linux');
@@ -83,29 +174,31 @@ console.log('settings.json installer');
       'BOM file: uninstall restores original settings');
   }
   const w = JSON.parse(I.computeHookSettings('', true, 'win32').content);
-  ok(w.hooks.PreToolUse[0].hooks[0].shell === 'powershell', 'Windows uses powershell hook');
+  ok(w.hooks.UserPromptSubmit[0].hooks[0].shell === 'powershell' && w.hooks.UserPromptSubmit[0].hooks[0].timeout === 30,
+    'Windows uses powershell hook, timeout 30');
 }
 
 (async () => {
   const isWin = process.platform === 'win32';
   const hasPwsh = (() => { try { cp.execSync('pwsh -NoProfile -c "exit 0"', { stdio: 'ignore' }); return true; } catch { return false; } })();
-  const vnFile = isWin ? 'C:\\ws\\thư mục\\ghi chú.md' : '/ws/thư mục/ghi chú.md';
-  const payload = { hook_event_name: 'PreToolUse', tool_name: 'Write', tool_use_id: 'x1', session_id: 's',
-    cwd: isWin ? 'C:\\ws' : '/ws', tool_input: { file_path: vnFile } };
+  const ws = isWin ? 'C:\\ws\\thư mục' : '/ws/thư mục';
+  const payload = { hook_event_name: 'UserPromptSubmit', session_id: 's', cwd: ws,
+    prompt: 'sửa ghi chú "quoted" $notAVar `tick`' };
 
   async function endToEnd(label, platform, shell, homeVar) {
     console.log(`End-to-end (${label}): real hook command → event files → source`);
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'home-'));
-    const cmd = JSON.parse(I.computeHookSettings('', true, platform).content).hooks.PreToolUse[0].hooks[0].command;
-    cp.execSync(cmd, { input: Buffer.from(JSON.stringify(payload), 'utf8'), env: { ...process.env, [homeVar]: home }, shell });
+    const cmd = JSON.parse(I.computeHookSettings('', true, platform).content).hooks.UserPromptSubmit[0].hooks[0].command;
+    const stdout = cp.execSync(cmd, { input: Buffer.from(JSON.stringify(payload), 'utf8'),
+      env: { ...process.env, [homeVar]: home }, shell });
+    ok(stdout.length === 0, `${label}: hook prints nothing (UserPromptSubmit stdout would reach Claude's context)`);
     const dir = path.join(home, '.ai-cli-diff-view', 'claude-events');
     const files = fs.readdirSync(dir);
     ok(files.length === 1 && files[0].endsWith('.json'), `${label}: hook wrote exactly one .json event file (no leftover .tmp)`);
-    ok(JSON.parse(fs.readFileSync(path.join(dir, files[0]), 'utf8')).tool_input.file_path === vnFile,
-      `${label}: Vietnamese path stored byte-exact`);
-    const src = new S.ClaudeHookSource(new A.ClaudeAttribution(), dir);
-    ok(await src.isClaudeWrite(vnFile, Date.now()), `${label}: non-ASCII path attributed`);
-    ok(!(await src.isClaudeWrite(isWin ? 'C:\\ws\\copied.txt' : '/ws/copied.txt', Date.now())), `${label}: copied file not attributed`);
+    const stored = JSON.parse(fs.readFileSync(path.join(dir, files[0]), 'utf8'));
+    ok(stored.cwd === ws && stored.prompt === payload.prompt, `${label}: non-ASCII payload stored byte-exact`);
+    const src = new S.ClaudeHookSource(new A.ClaudeAttribution({ workspaceFolders: () => [n(ws)] }), dir);
+    ok(await src.isClaudeWrite(path.join(ws, 'ghi chú.md'), Date.now()), `${label}: write during the recorded turn attributed`);
     ok(src.hasSeenAnyEvent(), `${label}: source reports hook is alive`);
   }
 
@@ -115,5 +208,29 @@ console.log('settings.json installer');
     await endToEnd('sh', 'linux', '/bin/sh', 'HOME');
     if (hasPwsh) { await endToEnd('pwsh', 'win32', 'pwsh', 'USERPROFILE'); }
   }
+
+  console.log('Event source');
+  {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'events-'));
+    let missed = 0;
+    const src = new S.ClaudeHookSource(make({ onStopWithoutStart: () => missed++ }), dir);
+    await new Promise(r => setTimeout(r, 20)); // event below is newer than the source → not historical
+    fs.writeFileSync(path.join(dir, 'stop.json'), JSON.stringify({ hook_event_name: 'Stop', session_id: 's9', cwd: '/ws' }));
+    await Promise.all([src.refresh(), src.refresh(), src.refresh()]);
+    ok(missed === 1, 'overlapping reads ingest a new Stop exactly once');
+  }
+  {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'events-'));
+    fs.writeFileSync(path.join(dir, 'start.json'), JSON.stringify({ hook_event_name: 'UserPromptSubmit', session_id: 's8', cwd: '/ws' }));
+    const tenMinAgo = new Date(Date.now() - 10 * 60_000);
+    fs.utimesSync(path.join(dir, 'start.json'), tenMinAgo, tenMinAgo);
+    let missed = 0;
+    const src = new S.ClaudeHookSource(make({ onStopWithoutStart: () => missed++ }), dir);
+    ok(await src.isClaudeWrite('/ws/a.ts', Date.now()), 'startup catch-up: a turn started 10 min before the window covers writes now');
+    fs.writeFileSync(path.join(dir, 'stop.json'), JSON.stringify({ hook_event_name: 'Stop', session_id: 's8', cwd: '/ws' }));
+    await src.refresh();
+    ok(missed === 0, 'startup catch-up: that turn\'s Stop is not a missed start');
+  }
+
   console.log(`\n${pass} checks passed`);
 })().catch(e => { console.error(e); process.exit(1); });
