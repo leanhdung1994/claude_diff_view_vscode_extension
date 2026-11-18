@@ -156,6 +156,10 @@ async function activateExtension(context: vscode.ExtensionContext): Promise<void
   context.subscriptions.push(
     diffManager.onDidChangeDiffs(() => updatePendingContext()),
     vscode.window.tabGroups.onDidChangeTabs(() => updatePendingContext()),
+    // Focusing another editor group changes the active tab without changing
+    // any tab, so onDidChangeTabs alone leaves activeIsPendingDiff stale.
+    vscode.window.tabGroups.onDidChangeTabGroups(() => updatePendingContext()),
+    vscode.window.onDidChangeActiveTextEditor(() => updatePendingContext()),
   );
 
   const autoRouteTab = (tab: vscode.Tab): void => {
