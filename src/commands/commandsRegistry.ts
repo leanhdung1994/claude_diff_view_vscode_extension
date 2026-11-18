@@ -33,7 +33,7 @@ export function registerAllCommands(deps: CommandDeps): void {
     vscode.commands.registerCommand('ai-cli-diff-view.acceptAllHunks', async () => {
       const filePath = getActiveDiffFilePath();
       if (!filePath) {
-        vscode.window.showWarningMessage('No active inline diff.');
+        vscode.window.showWarningMessage('No pending diff.');
         return;
       }
       await diffManager.accept(filePath);
@@ -56,7 +56,7 @@ export function registerAllCommands(deps: CommandDeps): void {
     vscode.commands.registerCommand('ai-cli-diff-view.revertAllHunks', async () => {
       const filePath = getActiveDiffFilePath();
       if (!filePath) {
-        vscode.window.showWarningMessage('No active inline diff.');
+        vscode.window.showWarningMessage('No pending diff.');
         return;
       }
       await diffManager.revert(filePath);

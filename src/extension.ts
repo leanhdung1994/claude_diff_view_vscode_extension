@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { DiffManager } from './diff/diffManager';
-import { DiffEditorProvider, DIFF_EDITOR_VIEW_TYPE } from './diff/diffWebviewPanel';
+import { SnapshotContentProvider } from './diff/snapshotContentProvider';
+import { SNAPSHOT_SCHEME } from './diff/snapshotUri';
 import { WorkspaceWatcher } from './watcher/workspaceWatcher';
 import { refreshTextFileRules } from './watcher/fileTypeRules';
 import { refreshFileSizeLimit } from './watcher/fileSizeLimit';
@@ -75,24 +76,18 @@ async function activateExtension(context: vscode.ExtensionContext): Promise<void
   debugLog('activate:configuration initialized');
 
   const diffManager       = new DiffManager(context);
+  // Register the left-side provider first, before anything awaits: VS Code
+  // may already be restoring diff tabs from the previous session.
+  const snapshotProvider  = new SnapshotContentProvider(diffManager);
+  context.subscriptions.push(
+    snapshotProvider,
+    vscode.workspace.registerTextDocumentContentProvider(SNAPSHOT_SCHEME, snapshotProvider),
+  );
   const editAttribution   = setupClaudeEditAttribution(context, debugLog);
   const workspaceWatcher  = new WorkspaceWatcher(diffManager, undefined, editAttribution);
   const gitBranchWatcher  = new GitBranchWatcher(diffManager, context.workspaceState, workspaceWatcher);
   const navigationManager = new NavigationManager(diffManager);
   debugLog('activate:core services constructed');
-
-  const diffEditorProvider = new DiffEditorProvider(context.extensionUri, diffManager);
-  context.subscriptions.push(
-    vscode.window.registerCustomEditorProvider(
-      DIFF_EDITOR_VIEW_TYPE,
-      diffEditorProvider,
-      {
-        webviewOptions: { retainContextWhenHidden: true },
-        supportsMultipleEditorsPerDocument: false,
-      }
-    )
-  );
-  debugLog('activate:custom editor provider registered');
 
   const pendingFilesPanel = new PendingFilesPanel(context.extensionUri, diffManager);
   context.subscriptions.push(
@@ -102,7 +97,7 @@ async function activateExtension(context: vscode.ExtensionContext): Promise<void
   debugLog('activate:pending files view registered');
 
   context.subscriptions.push(
-    { dispose: () => diffManager.disposeAll() },
+    diffManager,
     { dispose: () => workspaceWatcher.dispose() },
     { dispose: () => gitBranchWatcher.dispose() }
   );
@@ -151,8 +146,11 @@ async function activateExtension(context: vscode.ExtensionContext): Promise<void
 
   function updatePendingContext(): void {
     const hasPending = diffManager.getPendingFiles().length > 0;
-    pendingFilesPanel.setActiveFile(hasPending ? diffManager.getActiveFilePath() : undefined);
+    const activeDiff = diffManager.getActiveDiffPath();
+    pendingFilesPanel.setActiveFile(activeDiff);
     void vscode.commands.executeCommand('setContext', 'ai-cli-diff-view.hasPendingDiff', hasPending);
+    // Gates the diff tab's title-bar buttons and the Ctrl+Shift+Y/Z keybindings.
+    void vscode.commands.executeCommand('setContext', 'ai-cli-diff-view.activeIsPendingDiff', activeDiff !== undefined);
   }
 
   context.subscriptions.push(
@@ -188,6 +186,7 @@ async function activateExtension(context: vscode.ExtensionContext): Promise<void
   for (const group of vscode.window.tabGroups.all) {
     for (const tab of group.tabs) { autoRouteTab(tab); }
   }
+  await diffManager.closeStaleDiffTabs();
 
   updatePendingContext();
   debugLog('activate:complete');

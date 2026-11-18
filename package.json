@@ -21,7 +21,8 @@
     "Other"
   ],
   "activationEvents": [
-    "onStartupFinished"
+    "onStartupFinished",
+    "onFileSystem:ai-cli-diff-original"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -120,18 +121,9 @@
         }
       }
     },
-    "customEditors": [
-      {
-        "viewType": "ai-cli-diff-view.diffEditor",
-        "displayName": "AI CLI Diff",
-        "selector": [
-          {
-            "filenamePattern": "*"
-          }
-        ],
-        "priority": "option"
-      }
-    ],
+    "configurationDefaults": {
+      "diffEditor.hideUnchangedRegions.enabled": true
+    },
     "viewsContainers": {
       "activitybar": [
         {
@@ -153,7 +145,8 @@
     "commands": [
       {
         "command": "ai-cli-diff-view.acceptAllHunks",
-        "title": "AI CLI Diff: Accept All Changes"
+        "title": "AI CLI Diff: Accept All Changes",
+        "icon": "$(check)"
       },
       {
         "command": "ai-cli-diff-view.acceptAllChanges",
@@ -162,7 +155,8 @@
       },
       {
         "command": "ai-cli-diff-view.revertAllHunks",
-        "title": "AI CLI Diff: Revert All Changes"
+        "title": "AI CLI Diff: Revert All Changes",
+        "icon": "$(discard)"
       },
       {
         "command": "ai-cli-diff-view.openPendingFile",
@@ -175,23 +169,27 @@
       },
       {
         "command": "ai-cli-diff-view.nextFile",
-        "title": "AI CLI Diff: Next Edited File"
+        "title": "AI CLI Diff: Next Edited File",
+        "icon": "$(chevron-right)"
       },
       {
         "command": "ai-cli-diff-view.prevFile",
-        "title": "AI CLI Diff: Previous Edited File"
+        "title": "AI CLI Diff: Previous Edited File",
+        "icon": "$(chevron-left)"
       }
     ],
     "keybindings": [
       {
         "command": "ai-cli-diff-view.acceptAllHunks",
         "key": "ctrl+shift+y",
-        "mac": "cmd+shift+y"
+        "mac": "cmd+shift+y",
+        "when": "ai-cli-diff-view.activeIsPendingDiff"
       },
       {
         "command": "ai-cli-diff-view.revertAllHunks",
         "key": "ctrl+shift+z",
-        "mac": "cmd+shift+z"
+        "mac": "cmd+shift+z",
+        "when": "ai-cli-diff-view.activeIsPendingDiff"
       },
       {
         "command": "ai-cli-diff-view.prevFile",
@@ -205,6 +203,28 @@
       }
     ],
     "menus": {
+      "editor/title": [
+        {
+          "command": "ai-cli-diff-view.prevFile",
+          "when": "ai-cli-diff-view.activeIsPendingDiff",
+          "group": "navigation@1"
+        },
+        {
+          "command": "ai-cli-diff-view.nextFile",
+          "when": "ai-cli-diff-view.activeIsPendingDiff",
+          "group": "navigation@2"
+        },
+        {
+          "command": "ai-cli-diff-view.revertAllHunks",
+          "when": "ai-cli-diff-view.activeIsPendingDiff",
+          "group": "navigation@3"
+        },
+        {
+          "command": "ai-cli-diff-view.acceptAllHunks",
+          "when": "ai-cli-diff-view.activeIsPendingDiff",
+          "group": "navigation@4"
+        }
+      ],
       "view/title": [
         {
           "command": "ai-cli-diff-view.acceptAllChanges",
