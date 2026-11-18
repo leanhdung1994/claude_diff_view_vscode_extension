@@ -52,10 +52,14 @@ export interface DiffPreviewMetadata {
   hunks: number;
 }
 
-/** Cursor + scroll position of the diff's modified side, restored on reopen. */
+/**
+ * Where and how to reopen a file as a plain editor once its diff closes: the
+ * diff's editor group, and the cursor + scroll position of its modified side.
+ */
 interface ViewState {
-  cursor: vscode.Position;
-  topLine: number | undefined;
+  cursor?: vscode.Position;
+  topLine?: number;
+  viewColumn?: vscode.ViewColumn;
 }
 
 export class DiffManager implements vscode.Disposable {
@@ -530,19 +534,31 @@ export class DiffManager implements vscode.Disposable {
   }
 
   /**
-   * Cursor and scroll position of the visible editor showing the real file —
-   * in a diff, that is the modified (right) side.
+   * The editor group of the file's diff tab (the active one if several), plus
+   * the cursor and scroll position of the visible editor showing the real
+   * file — in a diff, that is the modified (right) side.
+   *
+   * The group matters with split editors: a diff's title-bar Accept/Revert can
+   * be clicked in a group that isn't the active one, and the plain editor must
+   * replace the diff there, not appear in the other group.
    */
   private captureViewState(absPath: string): ViewState | undefined {
+    const diffTabs = this.findDiffTabs(absPath);
+    const diffTab = diffTabs.find((tab) => tab.group.isActive) ?? diffTabs[0];
+    const viewColumn = diffTab?.group.viewColumn;
+
     const matches = (editor: vscode.TextEditor): boolean => (
-      editor.document.uri.scheme === 'file' && normalizePath(editor.document.uri.fsPath) === absPath
+      editor.document.uri.scheme === 'file' &&
+      normalizePath(editor.document.uri.fsPath) === absPath &&
+      (viewColumn === undefined || editor.viewColumn === viewColumn)
     );
     const active = vscode.window.activeTextEditor;
     const editor = active && matches(active) ? active : vscode.window.visibleTextEditors.find(matches);
-    if (!editor) { return undefined; }
+    if (!editor && viewColumn === undefined) { return undefined; }
     return {
-      cursor: editor.selection.active,
-      topLine: editor.visibleRanges[0]?.start.line,
+      cursor: editor?.selection.active,
+      topLine: editor?.visibleRanges[0]?.start.line,
+      viewColumn,
     };
   }
 
@@ -556,8 +572,11 @@ export class DiffManager implements vscode.Disposable {
       return;
     }
     const uri = vscode.Uri.file(canonicalCasePath(absPath));
-    const showOptions: vscode.TextDocumentShowOptions = { preview: false };
-    if (view) {
+    const showOptions: vscode.TextDocumentShowOptions = {
+      preview: false,
+      viewColumn: view?.viewColumn,
+    };
+    if (view?.cursor) {
       showOptions.selection = new vscode.Range(view.cursor, view.cursor);
     }
     try {
