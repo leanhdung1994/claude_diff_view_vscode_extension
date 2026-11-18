@@ -1,5 +1,11 @@
 # Bug #15 — Diff ít mà hiển thị thay cả file: điều tra đầy đủ
 
+> **Ghi chú lịch sử (2026-11-18):** tài liệu này viết khi diff còn render bằng
+> Monaco trong webview (`diffWebviewPanel.ts`, `res/webview/diff.monaco.js`).
+> Phần đó đã được thay bằng diff editor có sẵn của VS Code; các tham chiếu file/dòng
+> ở dưới chỉ còn trong lịch sử git. Nguyên tắc "LF ở giữa, EOL ở biên" vẫn áp dụng
+> cho `hunkCalculator` / `DiffManager`.
+
 > Issue: `#15 — diff ít mà thay cả file (diff sai)` · Người báo: konan-1947
 > Điều tra: 2026-08-16 → 2026-08-17 · Trạng thái: **đã vá và đã kiểm chạy thật** (§8.3, §9.1)
 >

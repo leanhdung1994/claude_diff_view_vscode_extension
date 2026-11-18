@@ -2,6 +2,12 @@
 
 Guideline cho người mới nhận maintain repo. Mục tiêu: hiểu **bài toán**, **kiến trúc hiện tại**, **các invariant không được phá**, và **cách thêm feature an toàn**.
 
+> **Cập nhật 2026-11-18:** diff giờ mở bằng diff editor có sẵn của VS Code (`vscode.diff`, vế trái là
+> snapshot qua scheme `ai-cli-diff-original:`), không còn Monaco webview, accept/reject theo hunk,
+> terminal tích hợp, Agent mode hay `startSession`. Các mục bên dưới nói về `diff.monaco.js`,
+> `state.groups`, `diffWebviewPanel.ts`, terminal… đã lỗi thời; [DIFF_VIEW_FLOW.md] đã bị xoá
+> (còn trong lịch sử git). Xem [CLAUDE.md](../../CLAUDE.md).
+>
 > Nguồn sự thật (source of truth) về kiến trúc là [CLAUDE.md](../CLAUDE.md) — nó là bản mô tả cập nhật nhất.
 > Một số tài liệu cũ đã **lỗi thời một phần**, xem mục [Tài liệu nào tin được](#8-tài-liệu-nào-tin-được).
 

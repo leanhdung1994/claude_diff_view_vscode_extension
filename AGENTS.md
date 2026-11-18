@@ -3,23 +3,21 @@
 ## Purpose
 
 AI CLI Diff View is a VS Code extension that detects file edits made by AI CLI
-tools and presents them as reviewable inline Monaco diffs. Claude, Codex, Qwen,
-and other tools are detected through workspace file events; the built-in
-session launcher is Claude-specific.
+tools and opens them in VS Code's built-in diff editor for review. Claude,
+Codex, Qwen, and other tools are detected through workspace file events; the
+extension does not launch or host any agent itself.
 
 ## Project Structure
 
 - `src/extension.ts` — extension activation and service wiring.
 - `src/commands/` — command registration and sound-notification settings.
-- `src/diff/` — diff state, snapshots, hunk calculation, navigation, and the
-  Monaco custom-editor webview.
-- `src/runner/` — AI runner interface and the built-in Claude runner.
-- `src/terminal/` — embedded xterm/node-pty terminal and pending-file UI.
-- `src/views/` — auxiliary webview panels such as the pending-diff nav bar.
+- `src/diff/` — diff state, snapshots, the snapshot content provider (left
+  side of each diff), hunk calculation, and navigation.
+- `src/attribution/` — opt-in Claude Code turn-window attribution.
+- `src/views/` — the Pending Files webview view.
 - `src/watcher/` — workspace writes, baseline scanning, file rules, size
   limits, burst detection, and Git branch-operation detection.
-- `res/webview/` — Monaco diff JavaScript and CSS loaded by the custom editor.
-- `media/` — icons, screenshots, and webview assets.
+- `media/` — activity-bar icon, file-type icons, README screenshots.
 - `code_to_test/` — manual smoke-test fixtures.
 - `docs/` — architecture notes and regression-test reports.
 - `out/` — generated TypeScript output; never edit by hand.
@@ -36,38 +34,39 @@ npx @vscode/vsce package
 There is no configured linter, formatter, or automated test runner. Run
 `npm run compile` after code changes, then press `F5` to launch the Extension
 Development Host for manual checks. Use files in `code_to_test/` to verify
-external edits, inline diff rendering, hunk accept/revert, pending-file
-navigation, branch changes, and terminal behavior.
+external edits, diff opening, file accept/revert, pending-file navigation,
+branch changes, and diff tabs restored after a window reload. Attribution has
+a script: `npm run compile && node scripts/test-attribution.js`.
 
-`node-pty` is a native dependency. If the terminal fails because of an Electron
-ABI mismatch, rebuild it with the installed `@electron/rebuild` dependency.
+`out/` is untracked and `tsc` never deletes stale output; `vscode:prepublish`
+cleans it before packaging. The only runtime dependency is `diff`.
 
 ## Runtime Architecture
 
-The extension activates on `onStartupFinished`. `extension.ts` creates and
-connects `DiffManager`, `WorkspaceWatcher`, `GitBranchWatcher`,
-`NavigationManager`, `DiffEditorProvider`, `TerminalPanelProvider`, and
-`NavBarPanel`, then registers commands and keybindings.
+The extension activates on `onStartupFinished` and on
+`onFileSystem:ai-cli-diff-original` (so restored diff tabs can resolve their
+left side). `extension.ts` creates and connects `DiffManager`,
+`SnapshotContentProvider`, `WorkspaceWatcher`, `GitBranchWatcher`,
+`NavigationManager`, and `PendingFilesPanel`, then registers commands.
 
 ### Diff editor
 
-Diffs use the custom editor `ai-cli-diff-view.diffEditor`, not VS Code's native
-diff editor. Each pending file gets a Monaco `DiffEditor` in its own webview
-tab. The left side is the before-image stored by `DiffManager`; the right side
-is the current file content.
+Each pending file opens with `vscode.diff`. The left side is the before-image
+stored by `DiffManager`, served read-only on the `ai-cli-diff-original:` scheme
+(same path as the file, only the scheme differs); the right side is the real
+file, so editing and saving work normally. Unchanged regions are collapsed via
+a `configurationDefaults` entry for `diffEditor.hideUnchangedRegions.enabled`.
 
-`DiffManager` owns pending snapshots, open panels, cursor state, persistence,
-and file-level accept/revert operations. Snapshots are persisted in VS Code
-workspace state under `ai-cli-diff.snapshots`, so changes to snapshot shape or
-cleanup must preserve restore compatibility.
+`DiffManager` owns pending snapshots, persistence, diff-tab bookkeeping (via
+`TabInputTextDiff`, no panel registry) and file-level accept/revert. Snapshots
+are persisted in VS Code workspace state under `ai-cli-diff.snapshots`, so
+changes to snapshot shape or cleanup must preserve restore compatibility.
 
-Hunk-level actions are sent between the webview and extension with
-`postMessage`. Accepting a hunk advances the in-memory baseline; reverting a
-hunk writes the original content back to disk. Keep this intentional asymmetry
-when changing diff behavior. `hunkCalculator.ts` and
-`res/webview/diff.monaco.js` also distinguish render sub-hunks from grouped
-action blocks, so changes to hunk grouping require checking both rendering and
-accept/revert behavior.
+There is no per-hunk accept/reject. Accepting a file deletes its snapshot;
+reverting writes the snapshot back to disk (or deletes a file the agent
+created). A pending file whose saved content matches its snapshot again is
+dropped automatically. When closing a diff, open the plain editor first, then
+close the diff tab, so unsaved edits never trigger a save prompt.
 
 ### Workspace and baseline detection
 
@@ -103,22 +102,23 @@ only resolve burst-held writes; they must not clear unrelated pending diffs.
 The current early-confirmation gap is `.git/index`/`index.lock` monitoring.
 Do not claim it is implemented unless the watcher is actually extended.
 
-### Webviews and terminal
+### UI
 
-- `ai-cli-diff-view.terminal` provides the embedded terminal, session status,
-  settings, and pending-file list. It is moved to the Secondary Side Bar once
-  per user installation.
-- `ai-cli-diff-view.navBar` provides the auxiliary pending-diff navigation
-  panel.
-- `res/webview/diff.monaco.js` and `diff.monaco.css` render the custom diff.
+- Diff tabs show title-bar buttons (previous / next file, revert, accept) when
+  the `ai-cli-diff-view.activeIsPendingDiff` context key is set;
+  `Ctrl+Shift+Y` / `Ctrl+Shift+Z` use the same key.
+- `ai-cli-diff-view.pendingFiles` (activity-bar container "AI CLI Diff") lists
+  pending files with `+/−` counts, with Accept All and Settings buttons in its
+  title bar.
 
 Navigation commands are `Alt+H` and `Alt+L`, gated by the
 `ai-cli-diff-view.hasPendingDiff` context key. A pending plain-text tab is
-automatically routed back to the custom diff editor.
+automatically routed back to its diff.
 
-Claude sound notifications are unrelated to diff detection. When enabled on
-Windows, `soundNotifications.ts` updates only the `Notification` and `Stop`
-entries in `~/.claude/settings.json` and preserves other settings.
+Claude sound notifications are unrelated to diff detection. When the setting
+changes (Windows only), `soundNotifications.ts` updates only its own
+`Notification` and `Stop` entries in `~/.claude/settings.json` and preserves
+other settings.
 
 ## Configuration
 
@@ -135,9 +135,11 @@ Contributed settings are defined in `package.json`:
   protection.
 - `soundNotificationsEnabled` controls the optional Windows Claude sounds.
 
-When changing a setting, update its configuration listener and any terminal
-settings UI that exposes it. Keep defaults and descriptions synchronized with
-the implementation.
+- `editAttribution` chooses between every external write and Claude Code
+  turn-window attribution.
+
+When changing a setting, update its configuration listener. Keep defaults and
+descriptions synchronized with the implementation.
 
 ## Coding Conventions
 

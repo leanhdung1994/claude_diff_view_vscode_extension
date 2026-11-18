@@ -6,8 +6,13 @@
  * which implements the Myers diff algorithm internally.
  *
  * The public export `calculateHunks()` is the sole entry point, used by
- * `DiffManager` and `DiffWebviewPanel` to produce the Hunk[] that drives
- * both the visual diff decorations and the accept/reject logic.
+ * `DiffManager` to decide whether a file still differs from its snapshot and
+ * to count +/− lines for the Pending Files view. The diff itself is rendered
+ * by VS Code's built-in diff editor, which runs its own algorithm.
+ *
+ * Pass 3 (`splitAlignedLines`) and `groupId` were built for the removed Monaco
+ * renderer's per-hunk accept/reject. They are kept unchanged; the only visible
+ * effect today is that the "N hunks" count in Pending Files counts sub-hunks.
  */
 
 import { diffArrays } from 'diff';
@@ -24,10 +29,8 @@ export interface Hunk {
    * TRƯỚC khi Pass 3 tách nó ra theo từng cặp dòng.
    *
    * Các hunk cùng `groupId` luôn nằm liền nhau và không có dòng không đổi xen
-   * giữa. Đây là ranh giới NGOÀI mà UI dùng để gom nút Accept/Reject; bên trong
-   * một `groupId`, webview còn cắt thêm ở mỗi chuyển tiếp dòng-thêm → dòng-xoá
-   * (xem `buildGroups()` trong res/webview/diff.monaco.js). Hunk không bị tách
-   * mang `groupId` bằng chính `id` của nó.
+   * giữa. Đây từng là ranh giới NGOÀI mà Monaco webview (đã xoá) dùng để gom nút
+   * Accept/Reject. Hunk không bị tách mang `groupId` bằng chính `id` của nó.
    */
   groupId: string;
   /**

@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What This Extension Does
 
 AI CLI diff view is a VS Code extension for reviewing AI CLI file edits inside VS Code.
-Best supported review workflows: Claude, Codex, and Qwen — all detected uniformly via the workspace watcher (no CLI-specific hooks). Built-in session launch (`startSession`) is Claude-only.
+Best supported review workflows: Claude, Codex, and Qwen — all detected uniformly via the workspace watcher (no CLI-specific hooks required). The extension does not launch or host any agent itself; the agent runs wherever the user likes (Claude Code extension, a terminal, …).
 
 ## Commands
 
@@ -13,56 +13,53 @@ Best supported review workflows: Claude, Codex, and Qwen — all detected unifor
 npm install
 npm run compile      # tsc -p ./  → out/  (main build / correctness check)
 npm run watch        # tsc -watch -p ./  (normal dev loop)
-npx @vscode/vsce package
+npx @vscode/vsce package   # runs vscode:prepublish = clean out/ + compile
 ```
 
 - Press `F5` to launch the Extension Development Host (`.vscode/launch.json`), and reload the host after each recompile.
-- There is no lint, formatter, or test runner configured. `npm run compile` is the minimum correctness gate. Manually validate diff rendering, accept/revert, and navigation against the sample files in `code_to_test/`.
-- `node-pty` is a **native module**. If the integrated terminal fails to load (ABI mismatch against VS Code's Electron), rebuild it with the `@electron/rebuild` devDependency. There is no postinstall script wiring this up.
-- Monaco and xterm assets are consumed directly from `node_modules/` at runtime (loaded into webviews via `localResourceRoots`); there is no separate asset bundling step.
+- There is no lint, formatter, or test runner configured. `npm run compile` is the minimum correctness gate. Manually validate diff opening, accept/revert, and navigation against the sample files in `code_to_test/`.
+- `out/` is untracked and `tsc` never deletes files, so output from deleted modules lingers locally; `vscode:prepublish` runs `npm run clean` first so it is never packaged.
+- The only runtime dependency is `diff`. There are no webview bundles or native modules.
 - Strict TypeScript (`tsconfig.json`: `strict: true`, CommonJS, ES2020 target). 2-space indentation, semicolons, single quotes; `PascalCase` for classes/providers, `camelCase` for functions/variables, `kebab-case` for asset filenames.
 
 ## Architecture
 
 ### Runtime shape
 
-`src/extension.ts` is the entry point, activated `onStartupFinished`. It wires together the `DiffManager`, the workspace and git-branch watchers, the Monaco diff custom-editor provider, the navigation manager, and both webview surfaces (terminal + nav bar), then registers commands.
+`src/extension.ts` is the entry point, activated `onStartupFinished` (and `onFileSystem:ai-cli-diff-original`, see below). It wires together the `DiffManager`, the snapshot content provider, the workspace and git-branch watchers, the navigation manager and the Pending Files view, then registers commands.
 
-The core responsibility: capture a before-image of a file, detect the after-image once an AI tool writes it, then present a reviewable Monaco diff while keeping enough per-file state to accept or reject individual hunks.
+The core responsibility: capture a before-image of a file, detect the after-image once an AI tool writes it, then show it in VS Code's built-in diff editor while keeping enough per-file state to accept or revert the whole file.
 
-### Diff rendering — Monaco custom editor (not native diff)
+### Diff rendering — VS Code's built-in diff editor
 
-This is the most important thing to understand and the biggest divergence from older docs.
-
-- The diff is **not** VS Code's built-in diff editor and **not** CodeLens-driven. It is a `CustomTextEditorProvider` (`src/diff/diffWebviewPanel.ts`, `DiffEditorProvider`, view type `ai-cli-diff-view.diffEditor`) that renders a **Monaco `DiffEditor` inside a webview**.
-- Each pending file opens as its own webview tab. Webview-side code lives in `res/webview/diff.monaco.js` / `diff.monaco.css`; Monaco itself is served from `node_modules/monaco-editor/min`.
-- The **left/original side** is the snapshot held in `DiffManager`; the **right/modified side** is the live `TextDocument` content.
-- Hunk-level accept/reject is driven by **postMessage** between the webview and the extension (`acceptHunk`, `rejectHunk`, `acceptAll`, `rejectAll`, `editModified`, `save`, `cursor`, `nextFile`/`prevFile` messages in `diffWebviewPanel.ts`) — **not** by registered VS Code commands.
-- The webview runs on **two different granularities**, and conflating them is the easy mistake: decorations/view zones iterate `state.hunks` (split per line pair so a removed line renders directly above its replacement), while buttons, hit-testing, F7 navigation and the "n / N" pill iterate `state.groups` — change blocks assembled by `buildGroups()`. A block ends on either boundary: (1) `Hunk.groupId` changes, i.e. an unchanged context line intervened, or (2) a sub-hunk contributes removed lines while the block already holds added lines, i.e. every added→removed transition. Rule (2) is a **deliberate divergence from git**, which refuses to split a hunk without a context line (`add -p`): here each replaced line gets its own button, while a purely-added line with no removed counterpart attaches to the pair above it. Accepting a block is a single `slice().concat()`; blocks stay contiguous in both index spaces, which is what makes that one splice correct.
-- `extension.ts` auto-routes tabs: if a pending file is opened as a plain text editor, that tab is closed and reopened through the custom diff editor (`autoRouteTab`).
+- `DiffManager.openDiff` calls `vscode.diff(left, right, '<name> (AI changes)')`. The **right/modified side** is the real file (`file:` URI), so editing, saving, undo, language features and keybindings are VS Code's own.
+- The **left/original side** is a read-only virtual document on the `ai-cli-diff-original:` scheme (`src/diff/snapshotUri.ts`). The URI is the file URI with only the scheme swapped, so it keeps the file name and language. `SnapshotContentProvider` (`src/diff/snapshotContentProvider.ts`) serves `DiffManager.getSnapshot(uri.fsPath)` and fires `onDidChange` for every open snapshot document on each `onDidChangeDiffs`.
+- Unchanged lines are collapsed through `contributes.configurationDefaults` → `diffEditor.hideUnchangedRegions.enabled: true`. That, inline vs side-by-side (`diffEditor.renderSideBySide`) and every other diff option are global user settings — there is no per-editor API.
+- There is **no per-hunk accept/reject** (by design). Accept/revert work on whole files. The diff editor's own "revert block" arrows still work: they edit the right side, and once the user saves content equal to the snapshot, `DiffManager.onDocumentSettled` drops the pending entry like an accept.
+- Diff tabs are recognised with `isPendingDiffInput()` — a `TabInputTextDiff` whose `original.scheme` is the snapshot scheme. There is no panel registry; `findDiffTabs` / `closeDiffTabs` scan `vscode.window.tabGroups`.
+- Diff tabs survive a window reload. The `onFileSystem:ai-cli-diff-original` activation event lets VS Code activate the extension to resolve a restored left side; the provider is registered synchronously at the top of `activateExtension`, and `closeStaleDiffTabs()` closes restored tabs whose snapshot is gone. `DiffManager.dispose()` therefore never closes tabs.
+- Accept/revert/clearAll/acceptAllPending **open the plain text editor first, then close the diff tab** (`reopenAsTextEditor` → `closeDiffTabs`). Closing the last editor of a document with unsaved edits would otherwise prompt save/discard. Cursor and scroll position come from `captureViewState()` — the visible `file:` editor for that path, i.e. the diff's right side.
+- `extension.ts` auto-routes tabs: if a pending file is opened as a plain text editor, that tab is closed and reopened as its diff (`autoRouteTab`). A file whose snapshot was just removed is not rerouted, which is what lets `reopenAsTextEditor` work.
+- `hunkCalculator.ts` (Myers via the `diff` library, compared on LF-normalised text) is still used to decide whether a file has any change at all (`openDiff` drops pure-EOL changes) and for the `+/−/hunks` counts in Pending Files. Its pass 3 (`splitAlignedLines`) and `groupId` were built for the removed Monaco renderer; the hunk count shown is the number of split sub-hunks.
 
 ### Diff state model
 
 `src/diff/diffManager.ts` is the center of the extension. It owns:
 
-- the original-content snapshot map (left side of each diff)
-- the live webview panel per file and last-seen Monaco cursor per file
+- the original-content snapshot map (left side of each diff), keyed by normalised path
 - persistence via `src/diff/snapshotStore.ts` in workspace state under `ai-cli-diff.snapshots` (survives VS Code restarts)
-- the public accept/revert/`acceptAllPending` operations used by commands and webview messages
+- the public `openDiff` / `accept` / `revert` / `acceptAllPending` / `clearAll` operations used by commands, the watchers and the Pending Files view
+- the "edited back to original" cleanup (`onDocumentSettled`, only on saved / non-dirty content, skipped for paths in `resolving` so `revert()`'s own save doesn't trigger it)
 
-`src/diff/hunkCalculator.ts` computes hunks (via the `diff` library / Myers) from `snapshot` vs `current` content. Pass 3 (`splitAlignedLines`) then splits each contiguous block into per-line-pair sub-hunks **for rendering only** — every sub-hunk keeps its parent's `groupId` so the UI can re-form the block. That function documents three invariants (order-preserving partition, first sub-hunk anchors match the parent, lengths sum) that group-level accept depends on; reordering or deduplicating sub-hunks would silently corrupt accept/reject. Accept and revert are intentionally asymmetric: accepting folds the change into the in-memory snapshot (new baseline on the left); reverting writes the original back to the real file on disk. When the last hunk for a file is resolved, `DiffManager.cleanup()` removes the snapshot, closes the diff tab, and may reopen the file as a normal editor preserving cursor/scroll.
+Accept and revert are intentionally asymmetric: accepting just deletes the snapshot (the file on disk already holds the agent's version); reverting writes the snapshot back to disk (or deletes a file the agent created). After either, the next pending file's diff opens.
 
 ### Two edit-detection pipelines
 
 Every CLI — including Claude — is detected through the workspace watcher. By default (`editAttribution = allExternalWrites`) every external write is treated as an agent edit. The opt-in Claude turn-window mode below only *filters* the watcher's writes; it is not a separate detection pipeline.
 
-**Workspace watcher (primary path for all external AI CLIs)**
+**Workspace watcher (the only path for agent edits)**
 
 `src/watcher/workspaceWatcher.ts` combines save events with a `FileSystemWatcher` for any external write, regardless of which tool made it. `src/watcher/baselineScanner.ts` builds the per-folder text-file baseline and `src/watcher/baselineStore.ts` stores it, so a newly written file is compared against prior content rather than treated as brand new. `src/watcher/pathExclusions.ts` filters out paths that should not be tracked. `src/watcher/writeBurstMeter.ts` decides whether a write is part of a burst (git checkout vs AI edits); writes past the burst threshold are held in `WorkspaceWatcher`'s `heldWrites` queue for `burstDetectionHoldMs` instead of opening a diff immediately — if `GitBranchWatcher` confirms a branch change in that window (`notifyExternalBatch()`), held writes are silently dropped; otherwise they open normally once the hold expires. See `docs/GIT_VS_AI_EDIT_DETECTION.md`.
-
-**Built-in runner (Claude-only)**
-
-`src/runner/runnerFactory.ts` detects whether `claude` is on PATH and returns a `ClaudeRunner` (`src/runner/claudeRunner.ts`), which spawns `claude` with stream-json output, snapshots files before `Write`/`Edit`/`MultiEdit`, and opens diffs when results arrive. `src/runner/aiRunner.ts` is the runner interface. Note this is the programmatic runner used by `startSession`; it is distinct from the interactive integrated terminal below.
 
 ### Claude turn-window attribution (opt-in, `editAttribution = claudeCodeHooks`)
 
@@ -76,22 +73,20 @@ Every CLI — including Claude — is detected through the workspace watcher. By
 
 ### Sound notifications (unrelated to diff detection)
 
-`src/commands/soundNotifications.ts` (`applySoundNotifications`) writes or removes `Notification`/`Stop` hook entries in `~/.claude/settings.json` (Windows only, via PowerShell `SoundPlayer`) based on the `ai-cli-diff-view.soundNotificationsEnabled` setting — toggled from the terminal panel's Settings popover. It only ever touches those two keys, preserving any other hooks already present in the file.
+`src/commands/soundNotifications.ts` (`applySoundNotifications`) writes or removes `Notification`/`Stop` hook entries in `~/.claude/settings.json` (Windows only, via PowerShell `SoundPlayer`). `extension.ts` calls it whenever `ai-cli-diff-view.soundNotificationsEnabled` changes. It only ever touches its own entries under those two keys, preserving any other hooks already present in the file.
 
 ### Git branch watcher
 
-`src/watcher/gitBranchWatcher.ts` watches each workspace root's `.git/HEAD` (resolving `gitdir:` for worktrees/submodules). On a HEAD ref change (branch switch / checkout / detached) it clears all pending diffs so stale snapshots aren't compared against a different branch's working tree. That content-compare path deliberately does **not** react to pull/rebase/reset on the same branch (those change `refs/heads/<branch>`, not HEAD's content) to avoid wiping pending state on every commit. Instead, `pull`/`merge`/`rebase`/`reset` on the same branch are confirmed via a second, narrower source: the same watcher also tails `.git/logs/HEAD` (reflog) and matches the action label git appends to the last line (`pull:`, `merge …`, `rebase (finish): …`, `reset: …`); on a match it calls `workspaceWatcher.notifyExternalBatch()` — silently dropping burst-held writes and rebuilding the baseline — **without** clearing already-open pending diffs, since those are unaffected by a same-branch pull/rebase/reset. `commit`/`checkout` are excluded from that regex on purpose (commit shouldn't suppress anything; checkout-to-another-ref is already handled by the HEAD-content path above).
-
-### Integrated terminal
-
-`src/terminal/` is an embedded PTY terminal (xterm.js webview + `node-pty`), shown by default in the Secondary Side Bar (extension.ts moves it there once via a one-time globalState flag). `src/terminal/terminalPanel.ts` (`TerminalPanelProvider`, view id `ai-cli-diff-view.terminal`) manages PTY sessions and also serves the pending-files / session-status page (`pendingFilesPage.ts`) — it plays the role the old session panel did. `ptySession.ts` wraps node-pty; `fontInstaller.ts` handles terminal fonts; `terminalHtml.ts` / `terminalTypes.ts` hold the webview shell and settings types.
+`src/watcher/gitBranchWatcher.ts` watches each workspace root's `.git/HEAD` (resolving `gitdir:` for worktrees/submodules). On a HEAD ref change (branch switch / checkout / detached) it clears all pending diffs (`DiffManager.clearAll`) so stale snapshots aren't compared against a different branch's working tree. That content-compare path deliberately does **not** react to pull/rebase/reset on the same branch (those change `refs/heads/<branch>`, not HEAD's content) to avoid wiping pending state on every commit. Instead, `pull`/`merge`/`rebase`/`reset` on the same branch are confirmed via a second, narrower source: the same watcher also tails `.git/logs/HEAD` (reflog) and matches the action label git appends to the last line (`pull:`, `merge …`, `rebase (finish): …`, `reset: …`); on a match it calls `workspaceWatcher.notifyExternalBatch()` — silently dropping burst-held writes and rebuilding the baseline — **without** clearing already-open pending diffs, since those are unaffected by a same-branch pull/rebase/reset. `commit`/`checkout` are excluded from that regex on purpose (commit shouldn't suppress anything; checkout-to-another-ref is already handled by the HEAD-content path above).
 
 ### UI composition
 
-- `src/terminal/terminalPanel.ts` — terminal + built-in runner status + pending files (Secondary Side Bar).
-- `src/views/diffActionPanel.ts` — diff action controls.
+- **Diff tabs** — VS Code's diff editor. Title-bar buttons (`editor/title`, shown when `ai-cli-diff-view.activeIsPendingDiff`): previous file, next file, revert file, accept file.
+- **Pending Files view** — `src/views/pendingFilesPanel.ts` (`PendingFilesPanel`, view id `ai-cli-diff-view.pendingFiles`) in the "AI CLI Diff" Activity Bar container. A webview tree of pending files with `+/−` counts from `DiffManager.getDiffPreviewMetadata()` (computed in the extension host; file contents never reach the webview), icons from `media/file-icons/`. Clicking a file calls `openDiff`. View title buttons: Accept All (`acceptAllChanges`) and a gear (`openSettings`, opens Settings filtered to this extension).
 
-Pending-file navigation logic lives in `src/diff/navigationManager.ts`, reachable via the `prevFile`/`nextFile` commands and their `Alt+H`/`Alt+L` keybindings (there is no dedicated nav-bar view). The `ai-cli-diff-view.hasPendingDiff` context key that gates those keybindings is kept in sync by `updatePendingContext` in `extension.ts` via `DiffManager.onDidChangeDiffs` and tab-change events.
+Pending-file navigation lives in `src/diff/navigationManager.ts`, reachable via the `prevFile`/`nextFile` commands, their `Alt+H`/`Alt+L` keybindings and the diff title-bar buttons. `updatePendingContext` in `extension.ts` keeps two context keys in sync via `DiffManager.onDidChangeDiffs` and tab-change events: `ai-cli-diff-view.hasPendingDiff` (any pending file) and `ai-cli-diff-view.activeIsPendingDiff` (the active tab is a pending diff).
+
+On startup, `restoreLegacyAgentModeTabs` restores a `workbench.editor.showTabs` value stored by the removed Agent mode, in case a window was closed while it was on.
 
 ### Configurable text-file detection
 
@@ -99,9 +94,9 @@ Pending-file navigation logic lives in `src/diff/navigationManager.ts`, reachabl
 
 ### Important implementation constraints
 
-- Path normalization is load-bearing: paths go through `vscode.Uri.file(...).fsPath` and are lowercased on Windows before comparison. `canonicalCasePath` (via `fs.realpathSync.native`) is used when calling VS Code APIs so tab titles show the on-disk case.
-- Snapshot persistence is designed to survive restarts; changes to snapshot shape or cleanup affect restore logic as well as live diffing.
-- Built-in session launch is Claude-only; Codex/Qwen (and Claude, when not run via `startSession`) edits are reviewed through the workspace watcher.
+- Path normalization is load-bearing: paths go through `vscode.Uri.file(...).fsPath` and are lowercased on Windows before comparison. `canonicalCasePath` (via `fs.realpathSync.native`) is used when calling VS Code APIs so tab titles show the on-disk case. Snapshot URIs are built from the canonical-case file URI; the provider maps them back through `normalizePath`.
+- Snapshot persistence is designed to survive restarts; changes to snapshot shape or cleanup affect restore logic (including restored diff tabs) as well as live diffing.
+- Snapshots keep the file's original bytes/EOL; hunk comparisons are done on LF-normalised text (`src/diff/eol.ts`).
 
 ## Settings (contributed configuration)
 
@@ -112,7 +107,7 @@ Pending-file navigation logic lives in `src/diff/navigationManager.ts`, reachabl
 | `ai-cli-diff-view.supportedFileExtensions` | Extra extensions to treat as text (dot optional) |
 | `ai-cli-diff-view.supportedFilenames` | Extra exact filenames to treat as text |
 | `ai-cli-diff-view.supportedFilenamePatterns` | Extra basename globs (`*`, `?`) to treat as text |
-| `ai-cli-diff-view.maxFileLines` | Advanced: ignore files above this many lines — no baseline, no diff (default 5000; `0` disables). Enforced in `src/watcher/fileSizeLimit.ts`, applied by `baselineScanner` and both write paths in `workspaceWatcher`. Skipped files are recorded in `BaselineStore.sizeSkipped` so that one later dropping below the limit is not mistaken for a brand-new file (which would make Revert all delete it) |
+| `ai-cli-diff-view.maxFileLines` | Advanced: ignore files above this many lines — no baseline, no diff (default 5000; `0` disables). Enforced in `src/watcher/fileSizeLimit.ts`, applied by `baselineScanner` and both write paths in `workspaceWatcher`. Skipped files are recorded in `BaselineStore.sizeSkipped` so that one later dropping below the limit is not mistaken for a brand-new file (which would make Revert delete it) |
 | `ai-cli-diff-view.baselineScanConcurrency` | Advanced: maximum number of files read concurrently during the initial baseline scan (default 4, range 1–16). Lower it for large or remote workspaces to reduce I/O and memory pressure. |
 | `ai-cli-diff-view.burstDetectionEnabled` | Advanced: hold files beyond the burst threshold to confirm a git branch change before opening their diff, instead of opening immediately (see `docs/GIT_VS_AI_EDIT_DETECTION.md`) |
 | `ai-cli-diff-view.burstDetectionWindowMs` | Advanced: sliding window (ms) used to count file changes for burst detection (default 300) |
@@ -120,18 +115,18 @@ Pending-file navigation logic lives in `src/diff/navigationManager.ts`, reachabl
 | `ai-cli-diff-view.burstDetectionHoldMs` | Advanced: how long (ms) to hold burst-threshold-exceeding files before opening their diff if no git branch change is confirmed (default 2000) |
 | `ai-cli-diff-view.soundNotificationsEnabled` | Play a sound when Claude finishes a turn or needs input (Windows only, default off) — unrelated to diff detection |
 
-The four burst-detection settings, `maxFileLines`, and the sound-notification toggle are all also editable via the terminal panel's Settings popover (`src/terminal/terminalHtml.ts`) — burst detection and `maxFileLines` under "Advanced", sound notifications in the general section — backed by the same `ai-cli-diff-view.*` configuration, not a separate storage. `.git/index`-based early confirmation is a known gap — the hold mechanism currently relies solely on `GitBranchWatcher`'s existing `HEAD`-change confirmation (see `docs/GIT_VS_AI_EDIT_DETECTION.md`).
+All of these are edited in VS Code's Settings UI (the Pending Files gear opens it filtered to this extension). `contributes.configurationDefaults` also sets `diffEditor.hideUnchangedRegions.enabled` to `true`. `.git/index`-based early confirmation is a known gap — the burst hold relies solely on `GitBranchWatcher`'s existing `HEAD`-change confirmation (see `docs/GIT_VS_AI_EDIT_DETECTION.md`).
 
 ## Registered Commands and Keybindings
 
 | Command | Keybinding | Purpose |
 | --- | --- | --- |
-| `ai-cli-diff-view.startSession` | `Ctrl+Shift+A` | Start a built-in (Claude) session |
-| `ai-cli-diff-view.acceptAllHunks` | `Ctrl+Shift+Y` | Accept all changes in the active file |
-| `ai-cli-diff-view.revertAllHunks` | `Ctrl+Shift+Z` | Revert all changes in the active file |
+| `ai-cli-diff-view.acceptAllHunks` | `Ctrl+Shift+Y` (when `activeIsPendingDiff`) | Accept the active (or first open) pending file |
+| `ai-cli-diff-view.revertAllHunks` | `Ctrl+Shift+Z` (when `activeIsPendingDiff`) | Revert the active (or first open) pending file |
 | `ai-cli-diff-view.acceptAllChanges` | — | Accept all pending changes across files |
 | `ai-cli-diff-view.openPendingFile` | — | Open a pending file's diff (takes a path arg) |
-| `ai-cli-diff-view.prevFile` | `Alt+H` | Go to previous pending file |
-| `ai-cli-diff-view.nextFile` | `Alt+L` | Go to next pending file |
+| `ai-cli-diff-view.openSettings` | — | Open Settings filtered to this extension |
+| `ai-cli-diff-view.prevFile` | `Alt+H` (when `hasPendingDiff`) | Go to previous pending file |
+| `ai-cli-diff-view.nextFile` | `Alt+L` (when `hasPendingDiff`) | Go to next pending file |
 
-Hunk-level accept/reject is handled inside the Monaco webview via postMessage, not as registered commands. The when-clause key `ai-cli-diff-view.hasPendingDiff` gates the navigation keybindings and pending-file UI.
+The `acceptAllHunks` / `revertAllHunks` ids are historical; they act on the whole file.

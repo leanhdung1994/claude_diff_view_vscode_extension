@@ -1,63 +1,51 @@
 # AI CLI diff view - Project Context
 
+The full, maintained architecture guide is [CLAUDE.md](CLAUDE.md) (and the
+shorter [AGENTS.md](AGENTS.md)). This file is a summary.
+
 ## Overview
 
-AI CLI diff view is a VS Code extension for reviewing AI-generated file edits as diffs inside the editor.
-
-Best supported workflows:
-- Claude
-- Codex
-- Qwen
-
-Current integration status:
-- Built-in session launch targets Claude Code.
-- Claude hook installation is built in.
-- External file watching still makes Codex and Qwen workflows reviewable inside VS Code.
+AI CLI diff view is a VS Code extension for reviewing AI-generated file edits
+in VS Code's built-in diff editor. Claude, Codex, Qwen and any other CLI are
+detected the same way: a workspace file watcher compares each external write
+against a baseline of the file's previous content.
 
 ## Project Structure
 
 ```text
 src/
-  claude/      runner integration
-  commands/    command registration
-  diff/        diff state, hunks, navigation, rendering
-  views/       sidebar and webview UI
-  watcher/     hook and workspace file monitoring
-hooks/         Claude CLI hook scripts
-media/         icons
-code_to_test/  local smoke-test files
-out/           compiled output
+  attribution/  opt-in Claude Code turn-window attribution (hooks)
+  commands/     command registration, sound-notification hooks
+  diff/         snapshots, snapshot content provider, hunks, navigation
+  views/        Pending Files webview view
+  watcher/      workspace writes, baseline, file rules, burst + git detection
+media/          activity-bar icon, file-type icons, README screenshots
+code_to_test/   local smoke-test files
+out/            compiled output (untracked)
 ```
 
 ## Main Flow
 
-1. Capture the original file contents before an AI edit.
-2. Detect the resulting file change.
-3. Open a diff editor with:
-   - original snapshot via `ai-cli-diff`
-   - modified file via `file`
-4. Show hunk actions so the user can accept or revert changes.
-
-## Important Paths And Keys
-
-- Snapshot directory: `%TEMP%/ai-cli-diff-snapshots/`
-- Signal directory: `%TEMP%/ai-cli-diff-signals/`
-- Debug log: `%TEMP%/ai-cli-diff-hook-debug.log`
-- Workspace state key: `ai-cli-diff.snapshots`
+1. The workspace watcher keeps a baseline of every reviewable text file.
+2. When a file is written outside VS Code, its previous content becomes a
+   snapshot in `DiffManager` (persisted under workspace state key
+   `ai-cli-diff.snapshots`).
+3. `vscode.diff` opens with the snapshot (`ai-cli-diff-original:` scheme) on the
+   left and the real file on the right; unchanged lines are collapsed.
+4. The user accepts (keep the file) or reverts (restore the snapshot) the whole
+   file.
 
 ## Commands
 
 | Command | Description |
 | --- | --- |
-| `ai-cli-diff-view.startSession` | Start a Claude session from VS Code |
-| `ai-cli-diff-view.acceptAllHunks` | Accept all changes in the current file |
-| `ai-cli-diff-view.acceptAllChanges` | Accept all pending file changes |
-| `ai-cli-diff-view.revertAllHunks` | Revert all changes in the current file |
-| `ai-cli-diff-view.acceptHunk` | Accept a single hunk |
-| `ai-cli-diff-view.revertHunk` | Revert a single hunk |
+| `ai-cli-diff-view.acceptAllHunks` | Accept the current file |
+| `ai-cli-diff-view.revertAllHunks` | Revert the current file |
+| `ai-cli-diff-view.acceptAllChanges` | Accept all pending files |
+| `ai-cli-diff-view.openPendingFile` | Open a pending file's diff |
+| `ai-cli-diff-view.openSettings` | Open the extension's settings |
 | `ai-cli-diff-view.nextFile` | Open the next pending file |
 | `ai-cli-diff-view.prevFile` | Open the previous pending file |
-| `ai-cli-diff-view.installHooks` | Install Claude CLI hooks |
 
 ## Development Notes
 
