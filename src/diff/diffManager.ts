@@ -61,6 +61,14 @@ interface ViewState {
 export class DiffManager implements vscode.Disposable {
   private _onDidChangeDiffs = new vscode.EventEmitter<void>();
   public readonly onDidChangeDiffs = this._onDidChangeDiffs.event;
+  /**
+   * The content of an already-pending file changed (the agent wrote it again,
+   * or the user saved it) while its pending state did not. Separate from
+   * onDidChangeDiffs so these frequent writes don't refresh snapshot documents
+   * or context keys — only views showing per-file counts need it.
+   */
+  private _onDidChangePendingContent = new vscode.EventEmitter<void>();
+  public readonly onDidChangePendingContent = this._onDidChangePendingContent.event;
 
   private snapshots: Map<string, SnapshotState> = new Map();
   private readonly store: SnapshotStore;
@@ -275,6 +283,17 @@ export class DiffManager implements vscode.Disposable {
     return this.snapshots.has(normalizePath(filePath));
   }
 
+  /**
+   * Called by WorkspaceWatcher when an already-pending file is written again.
+   * Needed when no editor has the file open: then VS Code raises no document
+   * event for the write.
+   */
+  notifyPendingContentChanged(filePath: string): void {
+    if (this.snapshots.has(normalizePath(filePath))) {
+      this._onDidChangePendingContent.fire();
+    }
+  }
+
   getPendingFiles(): string[] {
     return Array.from(this.snapshots.keys());
   }
@@ -372,6 +391,7 @@ export class DiffManager implements vscode.Disposable {
       this.disposables.pop()?.dispose();
     }
     this._onDidChangeDiffs.dispose();
+    this._onDidChangePendingContent.dispose();
   }
 
   /**
@@ -556,17 +576,21 @@ export class DiffManager implements vscode.Disposable {
   }
 
   /**
-   * A pending file whose saved content is back to its snapshot has nothing
-   * left to review (edited back by hand, the diff editor's revert arrows +
-   * save, or the agent undoing its own change): drop it like an accept.
+   * Saved/reloaded content of a pending file changed. If it is back to its
+   * snapshot there is nothing left to review (edited back by hand, the diff
+   * editor's revert arrows + save, or the agent undoing its own change): drop
+   * it like an accept. Otherwise only its +/− counts are out of date.
    */
   private onDocumentSettled(document: vscode.TextDocument): void {
     if (document.uri.scheme !== 'file' || document.isDirty) { return; }
     const absPath = normalizePath(document.uri.fsPath);
     if (this.resolving.has(absPath)) { return; }
     const snapshot = this.snapshots.get(absPath);
-    if (!snapshot?.fileExistedBefore) { return; }
-    if (toLf(document.getText()) !== toLf(snapshot.content)) { return; }
+    if (!snapshot) { return; }
+    if (!snapshot.fileExistedBefore || toLf(document.getText()) !== toLf(snapshot.content)) {
+      this._onDidChangePendingContent.fire();
+      return;
+    }
 
     void (async () => {
       const view = this.captureViewState(absPath);

@@ -493,6 +493,11 @@ export class WorkspaceWatcher {
       if (!this.diffManager.hasPendingDiff(absPath)) {
         if (!(await this.isAgentWrite(absPath, eventAt, { before: oldContentRaw!, existed: true, eventAt }))) { return; }
         this.resolveOrHold(absPath, oldContentRaw!, newContentRaw, true, burstHold);
+      } else {
+        // Already pending: its snapshot (left side) stays the version before
+        // the first edit and the diff shows the live file, so only the
+        // Pending Files counts need refreshing.
+        this.diffManager.notifyPendingContentChanged(absPath);
       }
     } catch {
       // file đang bị lock, không có quyền đọc hoặc đã bị xóa — bỏ qua

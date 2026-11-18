@@ -23,7 +23,12 @@ interface PendingFile {
 export class PendingFilesPanel implements vscode.WebviewViewProvider, vscode.Disposable {
   public static readonly viewType = 'ai-cli-diff-view.pendingFiles';
 
+  /** Coalesces a burst of writes to pending files into one recount. */
+  private static readonly CONTENT_REFRESH_DELAY_MS = 250;
+
   private readonly diffDisposable: vscode.Disposable;
+  private readonly contentDisposable: vscode.Disposable;
+  private contentRefreshTimer?: ReturnType<typeof setTimeout>;
   private view?: vscode.WebviewView;
   private viewMessageDisposable?: vscode.Disposable;
   private activeFilePath?: string;
@@ -36,6 +41,13 @@ export class PendingFilesPanel implements vscode.WebviewViewProvider, vscode.Dis
   ) {
     this.diffDisposable = this.diffManager.onDidChangeDiffs(() => {
       void this.refresh();
+    });
+    this.contentDisposable = this.diffManager.onDidChangePendingContent(() => {
+      if (this.contentRefreshTimer) { clearTimeout(this.contentRefreshTimer); }
+      this.contentRefreshTimer = setTimeout(() => {
+        this.contentRefreshTimer = undefined;
+        void this.refresh();
+      }, PendingFilesPanel.CONTENT_REFRESH_DELAY_MS);
     });
   }
 
@@ -242,7 +254,9 @@ ${rows || '<div class="empty">No pending changes</div>'}
 
   dispose(): void {
     this.generation += 1;
+    if (this.contentRefreshTimer) { clearTimeout(this.contentRefreshTimer); }
     this.diffDisposable.dispose();
+    this.contentDisposable.dispose();
     this.viewMessageDisposable?.dispose();
   }
 }
