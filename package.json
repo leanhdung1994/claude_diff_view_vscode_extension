@@ -1,7 +1,7 @@
 {
   "name": "ai-cli-diff-view",
   "displayName": "AI CLI diff view",
-  "description": "Cursor-like inline diff review for any AI CLI agent's file edits, right inside VS Code",
+  "description": "Review AI CLI agents' file edits in VS Code's diff editor before you keep them",
   "version": "4.0.2",
   "publisher": "konan1947",
   "license": "MIT",

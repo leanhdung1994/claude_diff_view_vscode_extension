@@ -18,7 +18,11 @@ tsconfig.json
 .gitignore
 .gitattributes
 node_modules/**
-!node_modules/diff/**
-!out/**
+# The extension is CommonJS, so `require('diff')` resolves to libcjs only.
+!node_modules/diff/package.json
+!node_modules/diff/LICENSE
+!node_modules/diff/libcjs/**/*.js
+!node_modules/diff/libcjs/package.json
+!out/**/*.js
 **/*.ts
 **/*.map

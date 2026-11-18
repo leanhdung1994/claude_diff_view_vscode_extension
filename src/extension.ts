@@ -84,7 +84,7 @@ async function activateExtension(context: vscode.ExtensionContext): Promise<void
     vscode.workspace.registerTextDocumentContentProvider(SNAPSHOT_SCHEME, snapshotProvider),
   );
   const editAttribution   = setupClaudeEditAttribution(context, debugLog);
-  const workspaceWatcher  = new WorkspaceWatcher(diffManager, undefined, editAttribution);
+  const workspaceWatcher  = new WorkspaceWatcher(diffManager, editAttribution);
   const gitBranchWatcher  = new GitBranchWatcher(diffManager, context.workspaceState, workspaceWatcher);
   const navigationManager = new NavigationManager(diffManager);
   debugLog('activate:core services constructed');

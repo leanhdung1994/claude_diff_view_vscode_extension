@@ -100,7 +100,6 @@ export class WorkspaceWatcher {
 
   constructor(
     private readonly diffManager: DiffManager,
-    private readonly shouldAutoOpenDiff: () => boolean = () => true,
     private readonly attribution?: EditAttribution
   ) {
     this.snapshots = new BaselineStore();
@@ -570,11 +569,6 @@ export class WorkspaceWatcher {
     // The open diff now owns this file's before-image.
     this.ignoredWrites.delete(filePath);
     this.diffManager.loadSnapshot(filePath, originalContent, fileExistedBefore);
-    // Agent Mode owns review in its central preview. Keep the pending snapshot
-    // so its changes sidebar refreshes, but never steal the main editor focus.
-    if (!this.shouldAutoOpenDiff()) {
-      return;
-    }
     this.diffManager.openDiff(filePath, fromBurstDump ? { preserveFocus: true } : undefined).catch((err: unknown) => {
       console.error('[ai-cli-diff-view] workspaceWatcher openDiff failed:', err);
     });
