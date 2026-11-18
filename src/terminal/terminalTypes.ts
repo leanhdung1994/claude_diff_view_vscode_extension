@@ -1,4 +1,7 @@
-export type ThemePreset = 'vscode' | 'default-dark' | 'solarized-dark' | 'dracula' | 'custom';
+import type { TERMINAL_THEMES } from './terminalThemes';
+
+/** `vscode` / `custom` are resolved in the webview; every other id comes from `TERMINAL_THEMES`. */
+export type ThemePreset = 'vscode' | 'custom' | (typeof TERMINAL_THEMES)[number]['id'];
 export type CursorStyle = 'block' | 'underline' | 'bar';
 
 export interface TerminalColors {
@@ -27,14 +30,28 @@ export interface SoundNotificationSettings {
   soundNotificationsEnabled: boolean;
 }
 
+/** See `src/commands/altMenuFocus.ts`. */
+export interface FocusSettings {
+  preventAltMenuFocus: boolean;
+}
+
 /** Giới hạn kích thước file được theo dõi. Xem `src/watcher/fileSizeLimit.ts`. */
 export interface FileLimitSettings {
   maxFileLines: number;
+  /** Most diff tabs opened automatically; 0 = no limit. See `src/watcher/autoOpenQueue.ts`. */
+  maxAutoOpenDiffs: number;
+}
+
+/** User-configured path exclusions. See `src/watcher/pathExclusions.ts`. */
+export interface ExclusionSettings {
+  excludedPaths: string[];
+  respectGitignore: boolean;
 }
 
 export interface TerminalSettingsPayload
-  extends TerminalSettings, BurstDetectionSettings, SoundNotificationSettings, FileLimitSettings {
-  supportedFileExtensions: string[];
+  extends TerminalSettings, BurstDetectionSettings, SoundNotificationSettings, FocusSettings, FileLimitSettings, ExclusionSettings {
+  /** `.gitignore`-style patterns of extra files to track. See `src/watcher/fileTypeRules.ts`. */
+  includedPaths: string[];
 }
 
 export const DEFAULT_BURST_DETECTION_SETTINGS: BurstDetectionSettings = {
@@ -48,28 +65,39 @@ export const DEFAULT_SOUND_NOTIFICATION_SETTINGS: SoundNotificationSettings = {
   soundNotificationsEnabled: false,
 };
 
+export const DEFAULT_FOCUS_SETTINGS: FocusSettings = {
+  preventAltMenuFocus: true,
+};
+
 export const DEFAULT_FILE_LIMIT_SETTINGS: FileLimitSettings = {
   maxFileLines: 5000,
+  maxAutoOpenDiffs: 50,
+};
+
+export const DEFAULT_EXCLUSION_SETTINGS: ExclusionSettings = {
+  excludedPaths: [],
+  respectGitignore: true,
 };
 
 /** 0 = tắt giới hạn. Trần trên chỉ để chặn nhập nhầm, không phải khuyến nghị. */
 export const MAX_FILE_LINES_CEILING = 200000;
+export const MAX_AUTO_OPEN_DIFFS_CEILING = 1000;
 
 export type IncomingMessage =
   | { type: 'ready' }
   | { type: 'toggleAgentMode' }
-  | { type: 'showPendingFiles' }
-  | { type: 'createSession'; cols: number; rows: number }
+  | { type: 'pendingOverlay'; open: boolean }
+  | { type: 'openPendingFile'; path: string }
+  | { type: 'createSession'; cols: number; rows: number; agent?: string }
+  | { type: 'requestAgents' }
   | { type: 'closeSession'; id: string }
   | { type: 'input'; id: string; data: string }
   | { type: 'resize'; id: string; cols: number; rows: number }
   | { type: 'restart'; id: string }
   | { type: 'getSettings' }
   | { type: 'updateSettings'; settings: TerminalSettingsPayload }
-  | { type: 'promptFileExtensions'; action: 'new' | 'edit'; value?: string }
   | { type: 'installFont'; primary: string }
   | { type: 'reloadWindow' }
-  | { type: 'openFile'; path: string }
   | { type: 'requestDiffPreview' }
   | { type: 'closeDiffPreview' }
   | { type: 'previewActiveFile'; path?: string }
@@ -84,9 +112,26 @@ export type IncomingMessage =
   | { type: 'closeFilePreview' }
   | { type: 'filePreviewEdit'; path: string; content: string }
   | { type: 'filePreviewSave'; path: string }
+  | { type: 'filePreviewOpenBeside'; path: string }
   | { type: 'introduceSeen' }
   | { type: 'terminalFocusState'; focused: boolean }
-  | { type: 'viewTooNarrow' };
+  | { type: 'sessionTitle'; title: string }
+  | { type: 'activeSession'; id: string }
+  | { type: 'viewTooNarrow' }
+  | { type: 'openLink'; url: string }
+  | { type: 'openTerminalFile'; path: string; line?: number; col?: number };
+
+/** One running session, as sent to a newly attached webview so it can redraw the tab. */
+export interface SessionSnapshot {
+  id: string;
+  title: string;
+  rawTitle: string;
+  serialized: string;
+  cols: number;
+  rows: number;
+  exited: boolean;
+  exitCode: number;
+}
 
 export const DEFAULT_SETTINGS: TerminalSettings = {
   fontFamily: 'Consolas, "Courier New", monospace',

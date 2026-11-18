@@ -25,6 +25,7 @@
   };
 
   tlog('require(editor.main) called');
+  const skeleton = document.getElementById('skeleton');
   require(['vs/editor/editor.main'], function () {
     tlog('editor.main loaded');
 
@@ -122,8 +123,9 @@
       const acc = document.getElementById('btn-accept-file');
       const rej = document.getElementById('btn-reject-file');
       const has = total > 0;
-      if (prev) { prev.disabled = !has || total < 2; }
-      if (next) { next.disabled = !has || total < 2; }
+      // Một khối vẫn bấm được: cuộn đi xa rồi bấm để quay lại khối đó (#47).
+      if (prev) { prev.disabled = !has; }
+      if (next) { next.disabled = !has; }
       if (acc) { acc.disabled = !has || state.inFlight; }
       if (rej) { rej.disabled = !has || state.inFlight; }
     }
@@ -224,6 +226,7 @@
       if (!msg) { return; }
       switch (msg.type) {
         case 'set': applySet(msg); return;
+        case 'nav': applyNav(msg.nav); return;
         case 'theme-change': applyTheme(msg.theme); return;
         case 'config-change':
           applyConfig(msg.editorConfig);
@@ -251,6 +254,7 @@
 
       document.getElementById('toolbar-file').textContent = msg.filePath;
       applyNav(msg.nav);
+      if (skeleton && skeleton.isConnected) { skeleton.remove(); }
 
       if (msg.theme && msg.theme !== state.currentTheme) {
         applyTheme(msg.theme);
@@ -734,6 +738,12 @@
         .concat(group.removedTexts, modLines.slice(group.modifiedStart + group.addedCount))
         .join('\n');
       return { newOriginal: state.originalContent, newCurrent };
+    }
+  }, function (err) {
+    console.error('[ai-cli-diff] failed to load Monaco:', err);
+    if (skeleton) {
+      skeleton.classList.add('failed');
+      skeleton.querySelector('.sk-error').hidden = false;
     }
   });
 })();

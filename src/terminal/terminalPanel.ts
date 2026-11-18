@@ -1,41 +1,44 @@
+import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { PtySession } from './ptySession';
+import { notify } from '../util/notify';
+import { TerminalSessionStore } from './terminalSessions';
+import { renderPendingTree } from '../views/pendingTree';
 import { findInstallableForPrimary, installFont } from './fontInstaller';
 import { DiffManager } from '../diff/diffManager';
-import {
-  buildPendingFilesInnerHtml,
-  SessionState,
-} from './pendingFilesPage';
+import { sortLikePendingTree } from '../diff/treeOrder';
 import { buildTerminalHtml } from './terminalHtml';
+import { detectAgents, findAgent } from './agentLauncher';
+import { coalesce } from '../util/coalesce';
+import { openBeside } from '../preview/openBeside';
+import { getPreviewKind, isBinaryImage } from '../preview/previewKind';
 import { applySoundNotifications } from '../commands/soundNotifications';
 import {
   BurstDetectionSettings,
   CursorStyle,
   DEFAULT_BURST_DETECTION_SETTINGS,
+  DEFAULT_EXCLUSION_SETTINGS,
   DEFAULT_FILE_LIMIT_SETTINGS,
+  DEFAULT_FOCUS_SETTINGS,
   DEFAULT_SETTINGS,
   DEFAULT_SOUND_NOTIFICATION_SETTINGS,
+  ExclusionSettings,
   FileLimitSettings,
+  FocusSettings,
   MAX_FILE_LINES_CEILING,
+  MAX_AUTO_OPEN_DIFFS_CEILING,
   IncomingMessage,
   SoundNotificationSettings,
   TerminalSettings,
   TerminalSettingsPayload,
   ThemePreset,
 } from './terminalTypes';
+import { THEME_PRESET_IDS } from './terminalThemes';
 
 const SETTINGS_KEY = 'ai-cli-diff-view.terminal.settings';
 const INTRODUCE_SEEN_KEY = 'ai-cli-diff-view.introduce.seen';
-
-interface SessionRecord {
-  pty: PtySession;
-  subs: vscode.Disposable[];
-  title: string;
-  cols: number;
-  rows: number;
-}
+const MAX_IMAGE_PREVIEW_BYTES = 10 * 1024 * 1024;
 
 export class TerminalPanelProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'ai-cli-diff-view.terminal';
@@ -45,19 +48,26 @@ export class TerminalPanelProvider implements vscode.WebviewViewProvider {
   private panel?: vscode.WebviewPanel;
   private webview?: vscode.Webview;
   private webviewMessageDisposable?: vscode.Disposable;
-  private sessions = new Map<string, SessionRecord>();
-  private nextSessionNum = 0;
+  private webviewDisposeDisposable?: vscode.Disposable;
+  private sessionSubs: vscode.Disposable[] = [];
+  /** Session output held back while a newly attached webview waits for its snapshot. */
+  private restoreQueue: unknown[] | undefined;
 
-  private sessionState: SessionState = 'idle';
-  private lastPrompt = '';
-  private errorMessage = '';
   private diffDisposable?: vscode.Disposable;
   private workspaceDiffDisposable?: vscode.Disposable;
   private themeDisposable?: vscode.Disposable;
   private lastTerminalFocused = false;
+  private windowBlurredAt = 0;
+  private blurTimer: NodeJS.Timeout | undefined;
   private agentModeActive = false;
   private focusWhenReady = false;
   private diffPreviewOpen = false;
+  /** Pending list changes come in bursts; resend the preview's file list once per burst. */
+  private readonly previewFilesSoon = coalesce(() => this.postDiffPreviewFiles());
+  /** Pending Files overlay drawn over the terminal (side bar); the terminal stays alive underneath. */
+  private pendingOverlayOpen = false;
+  private pendingGeneration = 0;
+  private readonly pendingFilesSoon = coalesce(() => { void this.postPendingFiles(); });
   private filePreviewOpen = false;
   private filePreviewPath?: string;
   private pendingAgentFilePath?: string;
@@ -69,12 +79,22 @@ export class TerminalPanelProvider implements vscode.WebviewViewProvider {
 
   constructor(
     private readonly context: vscode.ExtensionContext,
-    private readonly diffManager: DiffManager
+    private readonly diffManager: DiffManager,
+    private readonly sessions: TerminalSessionStore
   ) {
+    this.sessionSubs = [
+      sessions.onCreated(({ id, title }) => this.postSession({ type: 'sessionCreated', id, title })),
+      sessions.onClosed((id) => this.postSession({ type: 'sessionClosed', id })),
+      sessions.onData(({ id, data }) => this.postSession({ type: 'data', id, data })),
+      sessions.onExit(({ id, code }) => this.postSession({ type: 'exit', id, code })),
+      sessions.onError(({ id, message }) => this.postSession({ type: 'error', id, message })),
+    ];
     this.diffDisposable = this.diffManager.onDidChangeDiffs(() => {
-      this.postFilesUpdate();
       if (this.diffPreviewOpen) {
-        this.postDiffPreviewFiles();
+        this.previewFilesSoon.schedule();
+      }
+      if (this.pendingOverlayOpen) {
+        this.pendingFilesSoon.schedule();
       }
     });
     this.workspaceDiffDisposable = vscode.workspace.onDidChangeTextDocument((event) => {
@@ -89,29 +109,6 @@ export class TerminalPanelProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  // Public API used by commandsRegistry (mirrors the old SessionPanelProvider).
-  setRunning(prompt: string): void {
-    this.sessionState = 'running';
-    this.lastPrompt = prompt;
-    this.errorMessage = '';
-    this.postFilesUpdate();
-  }
-
-  setIdle(): void {
-    this.sessionState = 'idle';
-    this.postFilesUpdate();
-  }
-
-  setError(message: string): void {
-    this.sessionState = 'error';
-    this.errorMessage = message;
-    this.postFilesUpdate();
-  }
-
-  refresh(): void {
-    this.postFilesUpdate();
-  }
-
   setAgentMode(active: boolean): void {
     this.agentModeActive = active;
     void this.webview?.postMessage({ type: 'agentModeState', active });
@@ -119,10 +116,6 @@ export class TerminalPanelProvider implements vscode.WebviewViewProvider {
 
   toggleDiffPreview(): void {
     void this.webview?.postMessage({ type: 'toggleDiffPreview' });
-  }
-
-  togglePage(): void {
-    void this.webview?.postMessage({ type: 'togglePage' });
   }
 
   showIntroduce(): void {
@@ -137,15 +130,17 @@ export class TerminalPanelProvider implements vscode.WebviewViewProvider {
     if (!this.agentModeActive || !this.diffManager.hasPendingDiff(filePath)) {
       return false;
     }
+    // Explorer may spell the path with another case; use the one the pending list shows.
+    const displayPath = this.diffManager.getDisplayPath(filePath);
     this.filePreviewOpen = false;
     this.filePreviewPath = undefined;
     this.diffPreviewOpen = true;
     this._onDidChangePreviewVisibility.fire(true);
-    this._onDidChangePreviewActiveFile.fire(filePath);
+    this._onDidChangePreviewActiveFile.fire(displayPath);
     if (this.webview) {
-      void this.webview.postMessage({ type: 'showDiffPreview', path: filePath });
+      void this.webview.postMessage({ type: 'showDiffPreview', path: displayPath });
     } else {
-      this.pendingAgentFilePath = filePath;
+      this.pendingAgentFilePath = displayPath;
     }
     return true;
   }
@@ -159,6 +154,8 @@ export class TerminalPanelProvider implements vscode.WebviewViewProvider {
     }
     this.diffPreviewOpen = false;
     this._onDidChangePreviewVisibility.fire(false);
+    // Not a pending file: clear the pending-files highlight left by the previous file.
+    this._onDidChangePreviewActiveFile.fire(undefined);
     this.filePreviewOpen = true;
     this.filePreviewPath = filePath;
     if (this.webview) {
@@ -169,15 +166,61 @@ export class TerminalPanelProvider implements vscode.WebviewViewProvider {
     return true;
   }
 
+  /** Ctrl+Click on a URL / OSC 8 hyperlink in the terminal. */
+  private async openTerminalLink(url: string): Promise<void> {
+    let uri: vscode.Uri;
+    try {
+      uri = vscode.Uri.parse(url, true);
+    } catch {
+      return;
+    }
+    if (uri.scheme === 'file') {
+      await this.openTerminalFile(uri.fsPath);
+      return;
+    }
+    if (uri.scheme !== 'http' && uri.scheme !== 'https') {
+      return;
+    }
+    await vscode.env.openExternal(uri);
+  }
+
+  /** Ctrl+Click on a file path in the terminal: pending → diff, agent mode → in-panel preview. */
+  private async openTerminalFile(rawPath: string, line?: number, col?: number): Promise<void> {
+    const absPath = await resolveTerminalPath(rawPath);
+    if (!absPath) {
+      notify(`File not found: ${rawPath}`);
+      return;
+    }
+    try {
+      if (this.openFileInAgent(absPath)) {
+        return;
+      }
+      if (this.diffManager.hasPendingDiff(absPath)) {
+        await this.diffManager.openDiff(absPath);
+        return;
+      }
+      const options: vscode.TextDocumentShowOptions = { preview: true };
+      if (line && line > 0) {
+        const pos = new vscode.Position(line - 1, Math.max(0, (col ?? 1) - 1));
+        options.selection = new vscode.Range(pos, pos);
+      }
+      await vscode.commands.executeCommand('vscode.open', vscode.Uri.file(absPath), options);
+    } catch (err) {
+      void vscode.window.showErrorMessage(`Could not open file: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   focusTerminal(): void {
     if (!this.webview) {
+      // The view is being re-created (e.g. back from Pending Files); focus once it loads.
+      this.focusWhenReady = true;
       return;
     }
     try {
       if (this.view) {
         this.view.show(false);
       } else {
-        this.panel?.reveal(vscode.ViewColumn.Active, true);
+        this.panel?.reveal(undefined, false);
       }
       // Revealing the webview is not enough when the editor group was focused
       // by the pending-files view; put the cursor back in xterm as well.
@@ -193,65 +236,76 @@ export class TerminalPanelProvider implements vscode.WebviewViewProvider {
     return this.lastTerminalFocused;
   }
 
-  private postFilesUpdate(): void {
-    if (!this.webview) {
+  /** Called by the host on every window focus change so a terminal blur can be classed as alt-tab or click-away. */
+  noteWindowFocus(focused: boolean): void {
+    if (!focused) {
+      this.windowBlurredAt = Date.now();
+    }
+  }
+
+  /**
+   * Put the cursor back in xterm without revealing the panel, so a panel the
+   * user switched away from is not pulled to the front. Returns whether the
+   * message was sent; the webview may still decline (open overlay, input).
+   */
+  restoreTerminalFocus(): boolean {
+    const visible = this.panel ? this.panel.visible && this.panel.active : true;
+    if (!this.webview || !visible) {
+      return false;
+    }
+    void this.webview.postMessage({ type: 'focusTerminal', onlyIfIdle: true });
+    return true;
+  }
+
+  private onTerminalFocusState(focused: boolean): void {
+    clearTimeout(this.blurTimer);
+    if (focused) {
+      this.lastTerminalFocused = true;
       return;
     }
-    const html = buildPendingFilesInnerHtml({
-      diffManager: this.diffManager,
-      iconBase: this.fileIconsBase(),
-      sessionState: this.sessionState,
-      lastPrompt: this.lastPrompt,
-      errorMessage: this.errorMessage,
-    });
-    void this.webview.postMessage({ type: 'filesUpdate', html });
+    // A blur caused by alt-tab is followed by (or follows) the window losing
+    // focus; a blur caused by clicking another view is not. Wait for the
+    // window event before deciding.
+    const blurredAt = Date.now();
+    this.blurTimer = setTimeout(() => {
+      const windowLost = Math.abs(this.windowBlurredAt - blurredAt) < 300;
+      this.lastTerminalFocused = windowLost;
+    }, 300);
   }
 
-  private fileIconsBase(): string {
-    if (!this.webview) {
-      return '';
-    }
-    return this.webview
-      .asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'file-icons'))
-      .toString() + '/';
-  }
-
-  private spawnSession(cols: number, rows: number): { id: string; title: string } {
-    this.nextSessionNum += 1;
-    const id = `s${this.nextSessionNum}`;
-    const title = resolveShellName();
-    const pty = new PtySession();
-    const subs: vscode.Disposable[] = [
-      pty.onData((data) => {
-        this.webview?.postMessage({ type: 'data', id, data });
-      }),
-      pty.onExit((code) => {
-        this.webview?.postMessage({ type: 'exit', id, code });
-      }),
-      pty.onError((message) => {
-        this.webview?.postMessage({ type: 'error', id, message });
-      }),
-    ];
-    const safeCols = Math.max(1, cols | 0);
-    const safeRows = Math.max(1, rows | 0);
-    const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? os.homedir();
-    pty.start(cwd, safeCols, safeRows);
-    this.sessions.set(id, { pty, subs, title, cols: safeCols, rows: safeRows });
-    this.webview?.postMessage({ type: 'sessionCreated', id, title });
-    return { id, title };
-  }
-
-  private closeSessionInternal(id: string): void {
-    const rec = this.sessions.get(id);
-    if (!rec) {
+  /** Session messages keep their order behind a pending `restoreSessions` snapshot. */
+  private postSession(msg: unknown): void {
+    if (this.restoreQueue) {
+      this.restoreQueue.push(msg);
       return;
     }
-    for (const d of rec.subs) {
-      try { d.dispose(); } catch { /* ignore */ }
+    this.post(msg);
+  }
+
+  private post(msg: unknown): void {
+    try {
+      void this.webview?.postMessage(msg);
+    } catch {
+      // Webview disposed between the check and the call; nothing to deliver to.
     }
-    try { rec.pty.dispose(); } catch { /* ignore */ }
-    this.sessions.delete(id);
-    this.webview?.postMessage({ type: 'sessionClosed', id });
+  }
+
+  private async restoreSessions(): Promise<void> {
+    if (this.sessions.size === 0) {
+      this.sessions.create(80, 24);
+      return;
+    }
+    this.restoreQueue = [];
+    try {
+      const sessions = await this.sessions.snapshot();
+      this.post({ type: 'restoreSessions', sessions, activeId: this.sessions.activeId });
+    } finally {
+      const queued = this.restoreQueue ?? [];
+      this.restoreQueue = undefined;
+      for (const msg of queued) {
+        this.post(msg);
+      }
+    }
   }
 
   private loadSettings(): TerminalSettings {
@@ -278,8 +332,8 @@ export class TerminalPanelProvider implements vscode.WebviewViewProvider {
   }
 
   private normalizePreset(v: unknown): ThemePreset {
-    const presets: ThemePreset[] = ['vscode', 'default-dark', 'solarized-dark', 'dracula', 'custom'];
-    return presets.includes(v as ThemePreset) ? (v as ThemePreset) : DEFAULT_SETTINGS.themePreset;
+    const presets: string[] = ['vscode', 'custom', ...THEME_PRESET_IDS];
+    return presets.includes(v as string) ? (v as ThemePreset) : DEFAULT_SETTINGS.themePreset;
   }
 
   private normalizeCursorStyle(v: unknown): CursorStyle {
@@ -298,20 +352,67 @@ export class TerminalPanelProvider implements vscode.WebviewViewProvider {
   private loadSettingsPayload(): TerminalSettingsPayload {
     return {
       ...this.loadSettings(),
-      supportedFileExtensions: this.loadSupportedFileExtensions(),
+      includedPaths: this.loadIncludedPaths(),
       ...this.loadBurstDetectionSettings(),
       ...this.loadSoundNotificationSettings(),
+      ...this.loadFocusSettings(),
       ...this.loadFileLimitSettings(),
+      ...this.loadExclusionSettings(),
     };
+  }
+
+  private loadExclusionSettings(): ExclusionSettings {
+    const config = vscode.workspace.getConfiguration('ai-cli-diff-view');
+    return {
+      excludedPaths: this.normalizeExclusionList(
+        config.get<string[]>('excludedPaths', DEFAULT_EXCLUSION_SETTINGS.excludedPaths)
+      ),
+      respectGitignore: config.get<boolean>('respectGitignore', DEFAULT_EXCLUSION_SETTINGS.respectGitignore),
+    };
+  }
+
+  private async saveExclusionSettings(incoming: Partial<ExclusionSettings>): Promise<void> {
+    const current = this.loadExclusionSettings();
+    const config = vscode.workspace.getConfiguration('ai-cli-diff-view');
+    // Every write fires onDidChangeConfiguration → baseline rescan, so skip each
+    // update when Apply was pressed for some unrelated setting.
+    const next = this.normalizeExclusionList(incoming.excludedPaths);
+    if (!(next.length === current.excludedPaths.length && next.every((entry, i) => entry === current.excludedPaths[i]))) {
+      await config.update('excludedPaths', next, vscode.ConfigurationTarget.Global);
+    }
+    if (typeof incoming.respectGitignore === 'boolean' && incoming.respectGitignore !== current.respectGitignore) {
+      await config.update('respectGitignore', incoming.respectGitignore, vscode.ConfigurationTarget.Global);
+    }
+  }
+
+  /** Trim, drop empty entries and duplicates. Pattern parsing is left to `pathExclusions.ts` / `fileTypeRules.ts`. */
+  private normalizeExclusionList(values: unknown): string[] {
+    if (!Array.isArray(values)) {
+      return [];
+    }
+    const seen = new Set<string>();
+    const normalized: string[] = [];
+    for (const value of values) {
+      if (typeof value !== 'string') { continue; }
+      const entry = value.trim();
+      if (!entry || seen.has(entry)) { continue; }
+      seen.add(entry);
+      normalized.push(entry);
+    }
+    return normalized;
   }
 
   private loadFileLimitSettings(): FileLimitSettings {
     const config = vscode.workspace.getConfiguration('ai-cli-diff-view');
     const value = config.get<number>('maxFileLines', DEFAULT_FILE_LIMIT_SETTINGS.maxFileLines);
+    const maxAutoOpen = config.get<number>('maxAutoOpenDiffs', DEFAULT_FILE_LIMIT_SETTINGS.maxAutoOpenDiffs);
     return {
       maxFileLines: Number.isFinite(value)
         ? Math.min(MAX_FILE_LINES_CEILING, Math.max(0, Math.floor(value)))
         : DEFAULT_FILE_LIMIT_SETTINGS.maxFileLines,
+      maxAutoOpenDiffs: Number.isFinite(maxAutoOpen)
+        ? Math.min(MAX_AUTO_OPEN_DIFFS_CEILING, Math.max(0, Math.floor(maxAutoOpen)))
+        : DEFAULT_FILE_LIMIT_SETTINGS.maxAutoOpenDiffs,
     };
   }
 
@@ -324,6 +425,14 @@ export class TerminalPanelProvider implements vscode.WebviewViewProvider {
       typeof value === 'number' && Number.isFinite(value)
         ? Math.min(MAX_FILE_LINES_CEILING, Math.max(0, Math.floor(value)))
         : next.maxFileLines,
+      vscode.ConfigurationTarget.Global
+    );
+    const maxAutoOpen = incoming.maxAutoOpenDiffs;
+    await config.update(
+      'maxAutoOpenDiffs',
+      typeof maxAutoOpen === 'number' && Number.isFinite(maxAutoOpen)
+        ? Math.min(MAX_AUTO_OPEN_DIFFS_CEILING, Math.max(0, Math.floor(maxAutoOpen)))
+        : next.maxAutoOpenDiffs,
       vscode.ConfigurationTarget.Global
     );
   }
@@ -346,6 +455,23 @@ export class TerminalPanelProvider implements vscode.WebviewViewProvider {
     const config = vscode.workspace.getConfiguration('ai-cli-diff-view');
     await config.update('soundNotificationsEnabled', enabled, vscode.ConfigurationTarget.Global);
     applySoundNotifications(enabled);
+  }
+
+  private loadFocusSettings(): FocusSettings {
+    const config = vscode.workspace.getConfiguration('ai-cli-diff-view');
+    return {
+      preventAltMenuFocus: config.get<boolean>('preventAltMenuFocus', DEFAULT_FOCUS_SETTINGS.preventAltMenuFocus),
+    };
+  }
+
+  /** The window setting itself is applied by the config listener in extension.ts. */
+  private async saveFocusSettings(incoming: Partial<FocusSettings>): Promise<void> {
+    if (typeof incoming.preventAltMenuFocus !== 'boolean' ||
+        incoming.preventAltMenuFocus === this.loadFocusSettings().preventAltMenuFocus) {
+      return;
+    }
+    const config = vscode.workspace.getConfiguration('ai-cli-diff-view');
+    await config.update('preventAltMenuFocus', incoming.preventAltMenuFocus, vscode.ConfigurationTarget.Global);
   }
 
   private loadBurstDetectionSettings(): BurstDetectionSettings {
@@ -397,42 +523,18 @@ export class TerminalPanelProvider implements vscode.WebviewViewProvider {
     ]);
   }
 
-  private loadSupportedFileExtensions(): string[] {
+  private loadIncludedPaths(): string[] {
     const config = vscode.workspace.getConfiguration('ai-cli-diff-view');
-    return this.normalizeSupportedFileExtensions(config.get<string[]>('supportedFileExtensions', []));
+    return this.normalizeExclusionList(config.get<string[]>('includedPaths', []));
   }
 
-  private normalizeSupportedFileExtensions(values: unknown): string[] {
-    if (!Array.isArray(values)) {
-      return [];
-    }
-
-    const seen = new Set<string>();
-    const normalized: string[] = [];
-    for (const value of values) {
-      if (typeof value !== 'string') {
-        continue;
-      }
-      const ext = value.trim().toLowerCase();
-      if (!ext) {
-        continue;
-      }
-      const withDot = ext.startsWith('.') ? ext : `.${ext}`;
-      if (!seen.has(withDot)) {
-        seen.add(withDot);
-        normalized.push(withDot);
-      }
-    }
-    return normalized;
-  }
-
-  private async saveSupportedFileExtensions(values: unknown): Promise<void> {
+  private async saveIncludedPaths(values: unknown): Promise<void> {
+    // Same skip as excludedPaths: every write triggers a baseline rescan.
+    const current = this.loadIncludedPaths();
+    const next = this.normalizeExclusionList(values);
+    if (next.length === current.length && next.every((entry, i) => entry === current[i])) { return; }
     const config = vscode.workspace.getConfiguration('ai-cli-diff-view');
-    await config.update(
-      'supportedFileExtensions',
-      this.normalizeSupportedFileExtensions(values),
-      vscode.ConfigurationTarget.Global
-    );
+    await config.update('includedPaths', next, vscode.ConfigurationTarget.Global);
   }
 
   resolveWebviewView(webviewView: vscode.WebviewView): void {
@@ -440,6 +542,14 @@ export class TerminalPanelProvider implements vscode.WebviewViewProvider {
     this.view = webviewView;
     this.panel = undefined;
     this.attachWebview(webviewView.webview);
+    // A `when` clause turning false (Pending Files page, Agent mode) disposes the
+    // view; the shells live on in the session store until it is shown again.
+    this.webviewDisposeDisposable?.dispose();
+    this.webviewDisposeDisposable = webviewView.onDidDispose(() => {
+      if (this.view === webviewView) {
+        this.detachWebview();
+      }
+    });
     console.log('[ai-cli-diff-view] terminal:resolveWebviewView:complete');
   }
 
@@ -463,26 +573,36 @@ export class TerminalPanelProvider implements vscode.WebviewViewProvider {
     return panel;
   }
 
-  startFresh(): void {
-    this.disposeSessions();
-    this.render();
-  }
-
-  resetSessions(): void {
-    this.disposeSessions();
+  private detachWebview(): void {
+    this.webviewMessageDisposable?.dispose();
+    this.webviewMessageDisposable = undefined;
+    this.webviewDisposeDisposable?.dispose();
+    this.webviewDisposeDisposable = undefined;
+    this.webview = undefined;
+    this.view = undefined;
+    this.restoreQueue = undefined;
+    this.diffPreviewOpen = false;
+    this.filePreviewOpen = false;
+    this.pendingOverlayOpen = false;
   }
 
   private attachWebview(webview: vscode.Webview): void {
     this.webview = webview;
     const xtermDir = vscode.Uri.joinPath(this.context.extensionUri, 'media', 'xterm');
     const iconsDir = vscode.Uri.joinPath(this.context.extensionUri, 'media', 'file-icons');
+    const appIconsDir = vscode.Uri.joinPath(this.context.extensionUri, 'media', 'icons');
     const introDir = vscode.Uri.joinPath(this.context.extensionUri, 'media', 'introduce');
     const monacoDir = vscode.Uri.joinPath(this.context.extensionUri, 'node_modules', 'monaco-editor', 'min');
     const webviewDir = vscode.Uri.joinPath(this.context.extensionUri, 'res', 'webview');
+    const previewLibDirs = ['marked', 'dompurify', 'mermaid'].map((name) => (
+      vscode.Uri.joinPath(this.context.extensionUri, 'node_modules', name)
+    ));
+    // Workspace folders let the preview load relative images of a markdown file and image files.
+    const workspaceDirs = (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri);
 
     webview.options = {
       enableScripts: true,
-      localResourceRoots: [xtermDir, iconsDir, introDir, monacoDir, webviewDir],
+      localResourceRoots: [xtermDir, iconsDir, appIconsDir, introDir, monacoDir, webviewDir, ...previewLibDirs, ...workspaceDirs],
     };
 
     this.webviewMessageDisposable?.dispose();
@@ -495,12 +615,17 @@ export class TerminalPanelProvider implements vscode.WebviewViewProvider {
           console.log('[ai-cli-diff-view] terminal:toggleAgentMode');
           void vscode.commands.executeCommand('ai-cli-diff-view.toggleAgentMode');
           return;
-        case 'showPendingFiles':
-          void vscode.commands.executeCommand('ai-cli-diff-view.showPendingFiles');
+        case 'pendingOverlay':
+          this.pendingOverlayOpen = !!msg.open;
+          if (this.pendingOverlayOpen) {
+            void this.postPendingFiles();
+          }
+          return;
+        case 'openPendingFile':
+          void this.diffManager.openDiff(msg.path);
           return;
         case 'ready':
-          // Push initial files page state once the webview is ready.
-          this.postFilesUpdate();
+          void this.restoreSessions();
           this.setAgentMode(this.agentModeActive);
           if (this.focusWhenReady) {
             this.focusWhenReady = false;
@@ -520,58 +645,33 @@ export class TerminalPanelProvider implements vscode.WebviewViewProvider {
             void this.webview?.postMessage({ type: 'showIntroduce' });
           }
           return;
-        case 'createSession':
-          this.spawnSession(msg.cols, msg.rows);
+        case 'createSession': {
+          const id = this.sessions.create(msg.cols, msg.rows);
+          const agent = findAgent(msg.agent);
+          // The PTY buffers input until the shell is ready, so the command runs once it starts.
+          if (agent) { this.sessions.write(id, agent.command + '\r'); }
+          return;
+        }
+        case 'requestAgents':
+          void detectAgents().then((agents) => {
+            void this.webview?.postMessage({ type: 'agentAvailability', agents });
+          });
           return;
         case 'closeSession':
-          this.closeSessionInternal(msg.id);
-          if (this.sessions.size === 0) {
-            this.spawnSession(80, 24);
-          }
+          this.sessions.close(msg.id);
           return;
         case 'input':
-          this.sessions.get(msg.id)?.pty.write(msg.data);
+          this.sessions.write(msg.id, msg.data);
           return;
-        case 'resize': {
-          const rec = this.sessions.get(msg.id);
-          if (rec) {
-            rec.cols = Math.max(1, msg.cols | 0);
-            rec.rows = Math.max(1, msg.rows | 0);
-            rec.pty.resize(rec.cols, rec.rows);
-          }
+        case 'resize':
+          this.sessions.resize(msg.id, msg.cols, msg.rows);
           return;
-        }
-        case 'restart': {
-          const old = this.sessions.get(msg.id);
-          if (!old) {
-            return;
-          }
-          const { cols, rows, title } = old;
-          // Dispose old pty + subs but keep the id; emit data/exit/error under the same id.
-          for (const d of old.subs) {
-            try { d.dispose(); } catch { /* ignore */ }
-          }
-          try { old.pty.dispose(); } catch { /* ignore */ }
-          this.sessions.delete(msg.id);
-
-          const pty = new PtySession();
-          const id = msg.id;
-          const subs: vscode.Disposable[] = [
-            pty.onData((data) => {
-              this.webview?.postMessage({ type: 'data', id, data });
-            }),
-            pty.onExit((code) => {
-              this.webview?.postMessage({ type: 'exit', id, code });
-            }),
-            pty.onError((message) => {
-              this.webview?.postMessage({ type: 'error', id, message });
-            }),
-          ];
-          const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? os.homedir();
-          pty.start(cwd, cols, rows);
-          this.sessions.set(id, { pty, subs, title, cols, rows });
+        case 'activeSession':
+          this.sessions.activeId = msg.id;
           return;
-        }
+        case 'restart':
+          this.sessions.restart(msg.id);
+          return;
         case 'getSettings':
           this.webview?.postMessage({ type: 'settings', settings: this.loadSettingsPayload() });
           return;
@@ -609,28 +709,6 @@ export class TerminalPanelProvider implements vscode.WebviewViewProvider {
         case 'reloadWindow':
           void vscode.commands.executeCommand('workbench.action.reloadWindow');
           return;
-        case 'promptFileExtensions': {
-          const isEdit = msg.action === 'edit';
-          void vscode.window.showInputBox({
-            title: isEdit ? 'Edit file extension' : 'New file extension',
-            prompt: isEdit
-              ? 'Enter one file extension.'
-              : 'Enter one extension or multiple extensions separated by commas.',
-            value: isEdit && typeof msg.value === 'string' ? msg.value : '',
-            placeHolder: isEdit ? '.env' : '.env, .blade.php, .proto',
-          }).then((value) => {
-            if (typeof value !== 'string') {
-              return;
-            }
-            this.webview?.postMessage({
-              type: 'fileExtensionsPromptResult',
-              action: msg.action,
-              previousValue: msg.value,
-              value,
-            });
-          });
-          return;
-        }
         case 'updateSettings': {
           const next = this.loadSettings();
           const incoming = msg.settings ?? next;
@@ -652,22 +730,17 @@ export class TerminalPanelProvider implements vscode.WebviewViewProvider {
           };
           void Promise.all([
             this.saveSettings(sanitized),
-            this.saveSupportedFileExtensions(incoming.supportedFileExtensions),
+            this.saveIncludedPaths(incoming.includedPaths),
             this.saveBurstDetectionSettings(incoming),
             this.saveSoundNotificationSettings(incoming),
+            this.saveFocusSettings(incoming),
             this.saveFileLimitSettings(incoming),
+            this.saveExclusionSettings(incoming),
           ]).then(() => {
             this.webview?.postMessage({ type: 'settings', settings: this.loadSettingsPayload() });
           });
           return;
         }
-        case 'openFile':
-          if (msg.path && typeof msg.path === 'string') {
-            if (!this.openFileInAgent(msg.path)) {
-              void vscode.commands.executeCommand('ai-cli-diff-view.openPendingFile', msg.path);
-            }
-          }
-          return;
         case 'requestDiffPreview':
           this.diffPreviewOpen = true;
           this._onDidChangePreviewVisibility.fire(true);
@@ -704,6 +777,23 @@ export class TerminalPanelProvider implements vscode.WebviewViewProvider {
             this.postFilePreviewError(msg.path, err);
           });
           return;
+        case 'sessionTitle':
+          // Only the agent-mode panel has a title of its own; the sidebar view keeps its fixed name.
+          if (this.panel) {
+            this.panel.title = typeof msg.title === 'string' && msg.title.trim() ? msg.title : 'Agent Terminal';
+          }
+          return;
+        case 'openLink':
+          void this.openTerminalLink(msg.url);
+          return;
+        case 'openTerminalFile':
+          void this.openTerminalFile(msg.path, msg.line, msg.col);
+          return;
+        case 'filePreviewOpenBeside':
+          void openBeside(msg.path).catch((err: unknown) => {
+            void vscode.window.showErrorMessage(`Could not open file beside: ${err instanceof Error ? err.message : String(err)}`);
+          });
+          return;
         case 'requestDiffPreviewFile':
           void this.postDiffPreviewFile(msg.path);
           return;
@@ -737,7 +827,7 @@ export class TerminalPanelProvider implements vscode.WebviewViewProvider {
           void this.context.globalState.update(INTRODUCE_SEEN_KEY, true);
           return;
         case 'terminalFocusState':
-          this.lastTerminalFocused = !!msg.focused;
+          this.onTerminalFocusState(!!msg.focused);
           return;
         case 'viewTooNarrow':
           // Webview reports its width dropped below ~1/4 of screen width.
@@ -757,26 +847,29 @@ export class TerminalPanelProvider implements vscode.WebviewViewProvider {
     if (!this.webview) {
       return;
     }
-    const filesInner = buildPendingFilesInnerHtml({
-      diffManager: this.diffManager,
-      iconBase: this.fileIconsBase(),
-      sessionState: this.sessionState,
-      lastPrompt: this.lastPrompt,
-      errorMessage: this.errorMessage,
-    });
-
     this.webview.html = buildTerminalHtml({
       webview: this.webview,
       extensionUri: this.context.extensionUri,
-      filesInnerHtml: filesInner,
     });
+  }
+
+  private async postPendingFiles(): Promise<void> {
+    const generation = ++this.pendingGeneration;
+    const metadata = await this.diffManager.getDiffPreviewMetadata();
+    if (generation !== this.pendingGeneration || !this.webview || !this.pendingOverlayOpen) {
+      return;
+    }
+    const iconBase = this.webview.asWebviewUri(
+      vscode.Uri.joinPath(this.context.extensionUri, 'media', 'file-icons'),
+    ).toString() + '/';
+    this.post({ type: 'pendingFiles', html: renderPendingTree(metadata, undefined, iconBase) });
   }
 
   private postDiffPreviewFiles(): void {
     if (!this.webview || !this.diffPreviewOpen) {
       return;
     }
-    const files = this.diffManager.getPendingFiles().map((filePath) => ({
+    const files = sortLikePendingTree(this.diffManager.getPendingFiles()).map((filePath) => ({
       path: filePath,
       label: this.displayPath(filePath),
     }));
@@ -807,17 +900,55 @@ export class TerminalPanelProvider implements vscode.WebviewViewProvider {
   private async postFilePreview(filePath: string): Promise<void> {
     if (!this.webview || !this.filePreviewOpen) { return; }
     const uri = vscode.Uri.file(filePath);
+    const kind = getPreviewKind(filePath);
+    const label = this.displayPath(filePath);
+    const theme = currentMonacoTheme();
+
+    if (isBinaryImage(filePath)) {
+      const stat = await vscode.workspace.fs.stat(uri);
+      if (!this.webview || !this.filePreviewOpen) { return; }
+      if (stat.size > MAX_IMAGE_PREVIEW_BYTES) {
+        throw new Error(`Image is too large to preview (${(stat.size / 1048576).toFixed(1)} MB)`);
+      }
+      this.assertInWorkspace(uri);
+      void this.webview.postMessage({
+        type: 'filePreviewData', kind, path: filePath, label, theme,
+        src: this.webview.asWebviewUri(uri).toString(),
+        size: stat.size,
+      });
+      return;
+    }
+
     const openDocument = vscode.workspace.textDocuments.find((document) => document.uri.fsPath === filePath);
     const document = openDocument ?? await vscode.workspace.openTextDocument(uri);
     if (!this.webview || !this.filePreviewOpen) { return; }
-    void this.webview.postMessage({
+    const payload: Record<string, unknown> = {
       type: 'filePreviewData',
+      kind,
       path: filePath,
-      label: this.displayPath(filePath),
+      label,
       content: document.getText(),
       language: document.languageId,
-      theme: currentMonacoTheme(),
-    });
+      theme,
+    };
+    if (kind === 'image' || kind === 'markdown') {
+      // Webview URIs only resolve inside localResourceRoots; outside the workspace they would 404.
+      const inWorkspace = !!vscode.workspace.getWorkspaceFolder(uri);
+      if (kind === 'image') {
+        this.assertInWorkspace(uri);
+        payload.src = this.webview.asWebviewUri(uri).toString();
+      } else if (inWorkspace) {
+        const dir = vscode.Uri.file(path.dirname(filePath));
+        payload.baseUri = `${this.webview.asWebviewUri(dir).toString()}/`;
+      }
+    }
+    void this.webview.postMessage(payload);
+  }
+
+  private assertInWorkspace(uri: vscode.Uri): void {
+    if (!vscode.workspace.getWorkspaceFolder(uri)) {
+      throw new Error('File is outside the workspace, open it from the Explorer instead');
+    }
   }
 
   private async applyFilePreviewEdit(filePath: string, content: string): Promise<void> {
@@ -847,15 +978,25 @@ export class TerminalPanelProvider implements vscode.WebviewViewProvider {
   }
 
   dispose(): void {
-    this.disposeSessions();
+    // Sessions belong to the shared store and outlive this webview.
+    for (const d of this.sessionSubs) {
+      d.dispose();
+    }
+    this.sessionSubs = [];
+    this.restoreQueue = undefined;
     this.webviewMessageDisposable?.dispose();
     this.webviewMessageDisposable = undefined;
+    this.webviewDisposeDisposable?.dispose();
+    this.webviewDisposeDisposable = undefined;
     this.webview = undefined;
     this.view = undefined;
     this.panel = undefined;
     this.focusWhenReady = false;
     this.diffDisposable?.dispose();
     this.diffDisposable = undefined;
+    this.previewFilesSoon.dispose();
+    this.pendingFilesSoon.dispose();
+    this.pendingOverlayOpen = false;
     this.workspaceDiffDisposable?.dispose();
     this.workspaceDiffDisposable = undefined;
     this.themeDisposable?.dispose();
@@ -868,25 +1009,6 @@ export class TerminalPanelProvider implements vscode.WebviewViewProvider {
     this._onDidChangePreviewActiveFile.dispose();
     this._onDidChangePreviewVisibility.dispose();
   }
-
-  private disposeSessions(): void {
-    for (const rec of this.sessions.values()) {
-      for (const d of rec.subs) {
-        try { d.dispose(); } catch { /* ignore */ }
-      }
-      try { rec.pty.dispose(); } catch { /* ignore */ }
-    }
-    this.sessions.clear();
-  }
-}
-
-function resolveShellName(): string {
-  const shell =
-    vscode.env.shell ||
-    process.env['ComSpec'] ||
-    (process.platform === 'win32' ? 'powershell.exe' : '/bin/bash');
-  const base = path.basename(shell);
-  return base.replace(/\.exe$/i, '');
 }
 
 function currentMonacoTheme(): string {
@@ -896,4 +1018,48 @@ function currentMonacoTheme(): string {
     case vscode.ColorThemeKind.HighContrastLight: return 'hc-light';
     default: return 'vs-dark';
   }
+}
+
+/**
+ * Resolves a path printed in the terminal to an existing file. Relative paths are tried
+ * against every workspace folder (the shell starts in the first one; `cd` is not tracked),
+ * also without git's `a/` / `b/` diff prefix. Returns the on-disk case, or undefined.
+ */
+async function resolveTerminalPath(rawPath: string): Promise<string | undefined> {
+  let p = rawPath.trim();
+  if (!p) {
+    return undefined;
+  }
+  if (/^~[\/]/.test(p)) {
+    p = path.join(os.homedir(), p.slice(2));
+  }
+  const candidates: string[] = [];
+  if (path.isAbsolute(p)) {
+    candidates.push(p);
+  }
+  const relative = path.isAbsolute(p) && !/^[A-Za-z]:/.test(p) ? p.replace(/^[\/]+/, '') : p;
+  if (!path.isAbsolute(relative)) {
+    const variants = [relative];
+    if (/^[ab][\/]/.test(relative)) {
+      variants.push(relative.slice(2));
+    }
+    for (const folder of vscode.workspace.workspaceFolders ?? []) {
+      for (const v of variants) {
+        candidates.push(path.join(folder.uri.fsPath, v));
+      }
+    }
+  }
+  for (const candidate of candidates) {
+    const fsPath = vscode.Uri.file(candidate).fsPath;
+    try {
+      const stat = await fs.promises.stat(fsPath);
+      if (stat.isFile()) {
+        // realpath gives the on-disk case, so the tab title matches the file.
+        return await fs.promises.realpath(fsPath).catch(() => fsPath);
+      }
+    } catch {
+      // try the next candidate
+    }
+  }
+  return undefined;
 }

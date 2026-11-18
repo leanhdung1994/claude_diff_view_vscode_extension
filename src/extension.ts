@@ -3,17 +3,24 @@ import { DiffManager } from './diff/diffManager';
 import { DiffEditorProvider, DIFF_EDITOR_VIEW_TYPE } from './diff/diffWebviewPanel';
 import { IAiRunner } from './runner/aiRunner';
 import { WorkspaceWatcher } from './watcher/workspaceWatcher';
-import { refreshTextFileRules } from './watcher/fileTypeRules';
+import { migrateLegacyTextFileSettings, refreshTextFileRules } from './watcher/fileTypeRules';
 import { refreshFileSizeLimit } from './watcher/fileSizeLimit';
+import { clearGitignoreCache, isExcludedPathSegment, refreshPathExclusions } from './watcher/pathExclusions';
 import { GitBranchWatcher } from './watcher/gitBranchWatcher';
 import { registerAllCommands } from './commands/commandsRegistry';
+import { applyAltMenuFocus } from './commands/altMenuFocus';
 import { NavigationManager } from './diff/navigationManager';
 import { NavBarPanel } from './views/navBarPanel';
 import { AgentChangesPanel } from './views/agentChangesPanel';
 import { TerminalPanelProvider } from './terminal/terminalPanel';
+import { TerminalSessionStore } from './terminal/terminalSessions';
+import { forgetOpenedBeside, hasOpenedBeside, isOpenedBeside, onDidChangeOpenedBeside } from './preview/openBeside';
+import { coalesce } from './util/coalesce';
 
 const LOG_PREFIX = '[ai-cli-diff-view]';
 const AGENT_MODE_TABS_STATE_KEY = 'ai-cli-diff-view.agentMode.editorTabsState';
+// Whether Agent mode was on when the window last closed, so it comes back on the next launch.
+const AGENT_MODE_WAS_ACTIVE_KEY = 'ai-cli-diff-view.agentMode.wasActive';
 type ShowTabsSetting = 'multiple' | 'single' | 'none';
 
 interface AgentModeTabsState {
@@ -55,8 +62,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 async function activateExtension(context: vscode.ExtensionContext): Promise<void> {
   debugLog(`activate:start mode=${context.extensionMode} workspace=${vscode.workspace.workspaceFile?.fsPath ?? 'none'}`);
 
+  // Before the first read, so the rules and the Included files table see the result.
+  await migrateLegacyTextFileSettings();
   refreshTextFileRules();
   refreshFileSizeLimit();
+  refreshPathExclusions();
+  void applyAltMenuFocus(context).catch((err: unknown) => debugError('activate:altMenuFocus failed', err));
   debugLog('activate:configuration initialized');
 
   const diffManager       = new DiffManager(context);
@@ -64,6 +75,8 @@ async function activateExtension(context: vscode.ExtensionContext): Promise<void
   const workspaceWatcher  = new WorkspaceWatcher(diffManager, () => !agentModeActive);
   const gitBranchWatcher  = new GitBranchWatcher(diffManager, context.workspaceState, workspaceWatcher);
   const navigationManager = new NavigationManager(diffManager);
+  // Write out a burst save still waiting in DiffManager when the window closes or reloads.
+  context.subscriptions.push({ dispose: () => diffManager.flushPendingSave() });
   debugLog('activate:core services constructed');
 
   const diffEditorProvider = new DiffEditorProvider(context.extensionUri, diffManager);
@@ -89,12 +102,24 @@ async function activateExtension(context: vscode.ExtensionContext): Promise<void
   let agentModePanel: vscode.WebviewPanel | undefined;
   let agentModeTerminal: TerminalPanelProvider | undefined;
   let agentModeTabsState: AgentModeTabsState | undefined;
+  // Explorer only follows the active text editor, and agent mode hides those,
+  // so select the file there explicitly and then hand focus back to the agent.
+  const revealInExplorerKeepingFocus = async (filePath: string): Promise<void> => {
+    try {
+      await vscode.commands.executeCommand('revealInExplorer', vscode.Uri.file(filePath));
+      agentModePanel?.reveal(undefined, false);
+    } catch {
+      // Explorer unavailable (e.g. file outside workspace); highlight sync is best-effort.
+    }
+  };
   const agentChangesPanel = new AgentChangesPanel(
     context.extensionUri,
     diffManager,
     (filePath) => {
       if (agentModeActive) {
-        return !!agentModeTerminal?.openPendingFileInAgent(filePath);
+        const opened = !!agentModeTerminal?.openPendingFileInAgent(filePath);
+        if (opened) { void revealInExplorerKeepingFocus(filePath); }
+        return opened;
       }
       void diffManager.openDiff(filePath);
       return true;
@@ -151,29 +176,66 @@ async function activateExtension(context: vscode.ExtensionContext): Promise<void
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration('ai-cli-diff-view.supportedFileDetectionMode') ||
+          e.affectsConfiguration('ai-cli-diff-view.includedPaths') ||
           e.affectsConfiguration('ai-cli-diff-view.supportedFileExtensions') ||
           e.affectsConfiguration('ai-cli-diff-view.supportedFilenames') ||
           e.affectsConfiguration('ai-cli-diff-view.supportedFilenamePatterns')) {
         refreshTextFileRules();
+        // A newly included file has no baseline yet: its next write would look
+        // brand new and Revert all would delete it (same as excludedPaths below).
+        workspaceWatcher.rebuildBaselineAfterRuleChange();
       }
       if (e.affectsConfiguration('ai-cli-diff-view.maxFileLines')) {
         refreshFileSizeLimit();
       }
+      if (e.affectsConfiguration('ai-cli-diff-view.excludedPaths') ||
+          e.affectsConfiguration('ai-cli-diff-view.respectGitignore')) {
+        refreshPathExclusions();
+        // Files that were excluded during the initial scan have no baseline, so
+        // dropping an exclusion would make them look brand new — and Revert all
+        // would delete them. Rebuild the baseline against the new rules.
+        workspaceWatcher.rebuildBaselineAfterRuleChange();
+      }
+      if (e.affectsConfiguration('ai-cli-diff-view.preventAltMenuFocus')) {
+        void applyAltMenuFocus(context).catch((err: unknown) => debugError('altMenuFocus failed', err));
+      }
     })
   );
 
-  const terminalPanel = new TerminalPanelProvider(context, diffManager);
+  // A .gitignore edited while running changes what is tracked: re-read the rules
+  // and give newly un-ignored files a baseline (same reason as excludedPaths above).
+  // Ones inside built-in excluded folders (node_modules during npm install) are skipped.
+  const gitignoreChangedSoon = coalesce(() => {
+    clearGitignoreCache();
+    workspaceWatcher.rebuildBaselineAfterRuleChange();
+  });
+  const gitignoreWatcher = vscode.workspace.createFileSystemWatcher('**/.gitignore');
+  const onGitignoreChange = (uri: vscode.Uri): void => {
+    if (!isExcludedPathSegment(uri.fsPath)) { gitignoreChangedSoon.schedule(); }
+  };
+  context.subscriptions.push(
+    gitignoreWatcher,
+    gitignoreWatcher.onDidCreate(onGitignoreChange),
+    gitignoreWatcher.onDidChange(onGitignoreChange),
+    gitignoreWatcher.onDidDelete(onGitignoreChange),
+    { dispose: () => gitignoreChangedSoon.dispose() },
+  );
+
+  // Shells outlive the webviews showing them: the side bar view is disposed when
+  // hidden by its `when` clause, and Agent mode swaps in a panel of its own.
+  const terminalSessions = new TerminalSessionStore();
+  const terminalPanel = new TerminalPanelProvider(context, diffManager, terminalSessions);
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(
       TerminalPanelProvider.viewType,
       terminalPanel,
       { webviewOptions: { retainContextWhenHidden: true } }
     ),
-    { dispose: () => terminalPanel.dispose() }
+    { dispose: () => terminalPanel.dispose() },
+    terminalSessions
   );
   debugLog('activate:terminal webview provider registered');
   void vscode.commands.executeCommand('setContext', 'ai-cli-diff-view.terminalVisible', true);
-  void vscode.commands.executeCommand('setContext', 'ai-cli-diff-view.terminalFilesPage', false);
   void vscode.commands.executeCommand('setContext', 'ai-cli-diff-view.agentModeActive', false);
 
   const captureEditorTabsState = (): {
@@ -240,11 +302,12 @@ async function activateExtension(context: vscode.ExtensionContext): Promise<void
       return;
     }
 
-    const terminal = new TerminalPanelProvider(context, diffManager);
+    const terminal = new TerminalPanelProvider(context, diffManager, terminalSessions);
     const panel = terminal.openWebviewPanel();
     agentModeTerminal = terminal;
     agentModePanel = panel;
     terminal.setAgentMode(true);
+    terminal.focusTerminal();
     context.subscriptions.push(
       terminal.onDidChangePreviewActiveFile((filePath) => {
         if (agentModeActive && agentModeTerminal === terminal) {
@@ -267,7 +330,12 @@ async function activateExtension(context: vscode.ExtensionContext): Promise<void
       agentModeTerminal = undefined;
       debugLog('agent-mode:central terminal panel disposed');
       if (agentModeActive) {
-        void exitAgentMode();
+        void exitAgentMode(false);
+        // A shutdown kills the extension host before this fires, so the flag survives a window close;
+        // a user closing the Agent tab by hand clears it.
+        setTimeout(() => {
+          if (!agentModeActive) { void context.workspaceState.update(AGENT_MODE_WAS_ACTIVE_KEY, false); }
+        }, 1500);
       }
     }, null, context.subscriptions);
 
@@ -286,10 +354,9 @@ async function activateExtension(context: vscode.ExtensionContext): Promise<void
     }
     try {
       agentModeActive = true;
-      await vscode.commands.executeCommand('setContext', 'ai-cli-diff-view.terminalFilesPage', false);
+      void context.workspaceState.update(AGENT_MODE_WAS_ACTIVE_KEY, true);
       await vscode.commands.executeCommand('setContext', 'ai-cli-diff-view.agentModeActive', true);
       agentChangesPanel.setAgentMode(true);
-      terminalPanel.resetSessions();
       await hideEditorTabs();
       await vscode.commands.executeCommand('setContext', 'ai-cli-diff-view.terminalVisible', false);
       openAgentTerminal();
@@ -303,7 +370,12 @@ async function activateExtension(context: vscode.ExtensionContext): Promise<void
     }
   }
 
-  async function exitAgentMode(): Promise<void> {
+  // persist=false: the exit comes from the Agent panel being disposed, which also happens while the
+  // window shuts down — the caller decides later whether the user really closed it.
+  async function exitAgentMode(persist = true): Promise<void> {
+    if (persist) {
+      void context.workspaceState.update(AGENT_MODE_WAS_ACTIVE_KEY, false);
+    }
     if (!agentModeActive && !agentModeTabsState) {
       void vscode.commands.executeCommand('setContext', 'ai-cli-diff-view.agentModeActive', false);
       return;
@@ -325,8 +397,6 @@ async function activateExtension(context: vscode.ExtensionContext): Promise<void
       // terminal/webview operation must never leave editor tabs hidden.
       await restoreEditorTabs();
       await vscode.commands.executeCommand('setContext', 'ai-cli-diff-view.terminalVisible', true);
-      await vscode.commands.executeCommand('setContext', 'ai-cli-diff-view.terminalFilesPage', false);
-      terminalPanel.startFresh();
       terminalPanel.setAgentMode(false);
       terminalPanel.focusTerminal();
       debugLog('agent-mode:disabled');
@@ -363,7 +433,6 @@ async function activateExtension(context: vscode.ExtensionContext): Promise<void
 
   registerAllCommands({
     diffManager,
-    panel: terminalPanel,
     context,
     getRunner: () => activeRunner,
     setRunner: (r) => { activeRunner = r; },
@@ -376,15 +445,6 @@ async function activateExtension(context: vscode.ExtensionContext): Promise<void
   context.subscriptions.push(
     vscode.commands.registerCommand('ai-cli-diff-view.nextFile', () => navigationManager.nextFile()),
     vscode.commands.registerCommand('ai-cli-diff-view.prevFile', () => navigationManager.prevFile()),
-    vscode.commands.registerCommand('ai-cli-diff-view.showPendingFiles', async () => {
-      agentChangesPanel.setCodeModeFilesVisible(true);
-      await vscode.commands.executeCommand('setContext', 'ai-cli-diff-view.terminalFilesPage', true);
-    }),
-    vscode.commands.registerCommand('ai-cli-diff-view.showTerminal', async () => {
-      await vscode.commands.executeCommand('setContext', 'ai-cli-diff-view.terminalFilesPage', false);
-      agentChangesPanel.setCodeModeFilesVisible(false);
-      terminalPanel.focusTerminal();
-    }),
     vscode.commands.registerCommand('ai-cli-diff-view.focusAgentTerminal', () => {
       if (!agentModeActive || !agentModeTerminal) {
         return;
@@ -400,7 +460,16 @@ async function activateExtension(context: vscode.ExtensionContext): Promise<void
 
   context.subscriptions.push(
     vscode.window.onDidChangeWindowState((state) => {
-      if (!agentModeActive && state.focused && terminalPanel.wasTerminalFocused()) {
+      terminalPanel.noteWindowFocus(state.focused);
+      agentModeTerminal?.noteWindowFocus(state.focused);
+      if (!state.focused) {
+        return;
+      }
+      if (agentModeActive) {
+        if (agentModeTerminal?.wasTerminalFocused()) {
+          agentModeTerminal.restoreTerminalFocus();
+        }
+      } else if (terminalPanel.wasTerminalFocused()) {
         terminalPanel.focusTerminal();
       }
     })
@@ -422,16 +491,60 @@ async function activateExtension(context: vscode.ExtensionContext): Promise<void
     void vscode.commands.executeCommand('setContext', 'ai-cli-diff-view.hasPendingDiff', true);
   }
 
+  // Both events come in bursts (an agent writing many files opens many tabs):
+  // update the nav bar once per burst instead of once per event.
+  const navBarSoon = coalesce(updateNavBarState);
   context.subscriptions.push(
-    diffManager.onDidChangeDiffs(() => {
-      updateNavBarState();
-    })
+    { dispose: () => navBarSoon.dispose() },
+    diffManager.onDidChangeDiffs(() => navBarSoon.schedule()),
+    vscode.window.tabGroups.onDidChangeTabs(() => navBarSoon.schedule())
   );
+
+  // Agent mode hides the tab bar, so a file opened beside has no close button of its own.
+  const besideStatus = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 1000);
+  besideStatus.text = '$(close) Close side editor';
+  besideStatus.tooltip = 'Close the file opened beside the agent terminal';
+  besideStatus.command = 'ai-cli-diff-view.closeBesideEditors';
+  const updateBesideStatus = (): void => {
+    if (agentModeActive && hasOpenedBeside()) { besideStatus.show(); } else { besideStatus.hide(); }
+  };
   context.subscriptions.push(
-    vscode.window.tabGroups.onDidChangeTabs(() => updateNavBarState())
+    besideStatus,
+    onDidChangeOpenedBeside(updateBesideStatus),
+    vscode.commands.registerCommand('ai-cli-diff-view.closeBesideEditors', async () => {
+      const tabs = vscode.window.tabGroups.all.flatMap((group) => group.tabs).filter((tab) => (
+        (tab.input instanceof vscode.TabInputText || tab.input instanceof vscode.TabInputCustom)
+        && isOpenedBeside(tab.input.uri.fsPath)
+      ));
+      if (tabs.length > 0) { await vscode.window.tabGroups.close(tabs); }
+      agentModeTerminal?.focusTerminal();
+    }),
   );
 
   const autoRouteTab = (tab: vscode.Tab): void => {
+    const input = tab.input;
+    if (
+      agentModeActive
+      && (input instanceof vscode.TabInputText || input instanceof vscode.TabInputCustom)
+      && isOpenedBeside(input.uri.fsPath)
+    ) {
+      // The user sent this file to a side editor from the preview on purpose.
+      return;
+    }
+    // Custom editors (markdown/image viewers from other extensions) are not TabInputText;
+    // in agent mode they would cover the terminal, so route them to the in-panel preview too.
+    if (
+      agentModeActive && agentModeTerminal
+      && tab.input instanceof vscode.TabInputCustom
+      && tab.input.viewType !== 'ai-cli-diff-view.diffEditor'
+      && tab.input.uri.scheme === 'file'
+    ) {
+      const fsPath = tab.input.uri.fsPath;
+      void vscode.window.tabGroups.close(tab).then(() => {
+        agentModeTerminal?.openFileInAgent(fsPath);
+      });
+      return;
+    }
     if (!(tab.input instanceof vscode.TabInputText)) { return; }
     // A tab becomes `changed` when the user edits it. Never close a dirty
     // document from the auto-router: doing so makes VS Code show its
@@ -459,6 +572,11 @@ async function activateExtension(context: vscode.ExtensionContext): Promise<void
     vscode.window.tabGroups.onDidChangeTabs((e) => {
       for (const tab of e.opened) { autoRouteTab(tab); }
       for (const tab of e.changed) { autoRouteTab(tab); }
+      for (const tab of e.closed) {
+        if (tab.input instanceof vscode.TabInputText || tab.input instanceof vscode.TabInputCustom) {
+          forgetOpenedBeside(tab.input.uri.fsPath);
+        }
+      }
     })
   );
 
@@ -467,6 +585,10 @@ async function activateExtension(context: vscode.ExtensionContext): Promise<void
   }
 
   updateNavBarState();
+  if (context.workspaceState.get<boolean>(AGENT_MODE_WAS_ACTIVE_KEY)) {
+    debugLog('agent-mode:restoring previous session state');
+    await enterAgentMode();
+  }
   debugLog('activate:complete');
 }
 
