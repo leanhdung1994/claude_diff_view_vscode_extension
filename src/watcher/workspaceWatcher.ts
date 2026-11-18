@@ -601,6 +601,20 @@ export class WorkspaceWatcher {
     }
     this.lastAutoOpenActivityAt = now;
 
+    // Already held (written again while its burst awaits git confirmation):
+    // the held entry has the before-image from BEFORE the first write, while
+    // `originalContent` here is the baseline, which already contains the first
+    // write. Keep the earliest one, otherwise the diff hides the first write
+    // and Revert only goes back to the in-between version. This applies even
+    // when this write is not itself a burst: opening now would use the
+    // in-between version and skip the pending git check for this file. The
+    // hold timer is already running and opens the diff when it fires.
+    const held = this.heldWrites.get(filePath);
+    if (held) {
+      held.newContent = newContent;
+      return;
+    }
+
     if (!hold) {
       this.triggerDiff(filePath, originalContent, newContent, fileExistedBefore);
       return;
