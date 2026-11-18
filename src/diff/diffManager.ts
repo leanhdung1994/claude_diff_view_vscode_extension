@@ -562,7 +562,15 @@ export class DiffManager implements vscode.Disposable {
     };
   }
 
-  private async reopenAsTextEditor(absPath: string, view: ViewState | undefined): Promise<void> {
+  /**
+   * @param opts.preserveFocus Keep keyboard focus where it is. Used when the
+   *   reopen is not a reaction to the user acting on this diff.
+   */
+  private async reopenAsTextEditor(
+    absPath: string,
+    view: ViewState | undefined,
+    opts?: { preserveFocus?: boolean }
+  ): Promise<void> {
     try {
       await vscode.workspace.fs.stat(vscode.Uri.file(absPath));
     } catch (err) {
@@ -575,6 +583,7 @@ export class DiffManager implements vscode.Disposable {
     const showOptions: vscode.TextDocumentShowOptions = {
       preview: false,
       viewColumn: view?.viewColumn,
+      preserveFocus: opts?.preserveFocus === true,
     };
     if (view?.cursor) {
       showOptions.selection = new vscode.Range(view.cursor, view.cursor);
@@ -599,6 +608,12 @@ export class DiffManager implements vscode.Disposable {
    * snapshot there is nothing left to review (edited back by hand, the diff
    * editor's revert arrows + save, or the agent undoing its own change): drop
    * it like an accept. Otherwise only its +/− counts are out of date.
+   *
+   * Unlike Accept/Revert, this can be triggered by the agent while the user
+   * works elsewhere, so it must not move focus or bring a hidden tab forward:
+   * a diff that is the visible tab of its group is replaced in place by the
+   * plain file without taking focus; a background diff tab is just closed
+   * (the document isn't dirty here, so closing never prompts).
    */
   private onDocumentSettled(document: vscode.TextDocument): void {
     if (document.uri.scheme !== 'file' || document.isDirty) { return; }
@@ -612,16 +627,18 @@ export class DiffManager implements vscode.Disposable {
     }
 
     void (async () => {
-      const view = this.captureViewState(absPath);
-      const diffWasOpen = this.findDiffTabs(absPath).length > 0;
+      const visibleDiff = this.findDiffTabs(absPath).find((tab) => tab.isActive);
+      const view = visibleDiff
+        ? { ...this.captureViewState(absPath), viewColumn: visibleDiff.group.viewColumn }
+        : undefined;
       this.resolving.add(absPath);
       try {
         this.snapshots.delete(absPath);
         void this.store.save(this.snapshots);
-        if (diffWasOpen) {
-          await this.reopenAsTextEditor(absPath, view);
-          await this.closeDiffTabs(absPath);
+        if (view) {
+          await this.reopenAsTextEditor(absPath, view, { preserveFocus: true });
         }
+        await this.closeDiffTabs(absPath);
       } finally {
         this.resolving.delete(absPath);
       }
